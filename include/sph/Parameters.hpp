@@ -28,7 +28,7 @@ inline constexpr float aneosMaxT = 1e5f;
 
 inline constexpr float cfl = 0.2f;
 inline constexpr float gdt = 0.5f;
-inline constexpr float minDt = 0.0001f;
+inline constexpr float minDt = 0.001f;
 inline constexpr float maxDt = 100.0f;
 inline constexpr int densityGradientSettlingIterations = 3;
 inline constexpr int activateAllSteps = 8192;
