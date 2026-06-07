@@ -1,0 +1,355 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const float GAMMA = 1.825742;
+const float GAMMA1 = 1.0 / GAMMA;
+const float KERNEL_CONSTANT = 16.0 / 3.14159265358979323846;
+const float MAX_SMOOTHING_LENGTH = 1.0;
+const float RESOLUTION_ETA = 1.2348;
+const float ALPHA_MIN = 0.1;
+const float ALPHA_MAX = 2.0;
+const float DENSITY_ETA = 0.001;
+const int MAX_DENSITY_NR_ITERATIONS = 50;
+const int PARTICLE_IN_RANGE_THRESHOLD = 10;
+const int N_NEIGHBOURS_ESTIM = 128;
+const float CELL_WIDTH = 0.15;
+const int CELL_POWER = 7;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 2) buffer Densities { float densities[]; };
+layout(std430, binding = 3) readonly buffer InternalEnergy { float internalEnergy[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) buffer SmoothingLengths { float smoothingLengths[]; };
+layout(std430, binding = 6) buffer Pressures { float pressures[]; };
+layout(std430, binding = 7) readonly buffer MaterialIds { int materialIds[]; };
+layout(std430, binding = 8) buffer Temperatures { float temperatures[]; };
+layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
+layout(std430, binding = 10) readonly buffer Accelerations { vec4 accelerations[]; };
+layout(std430, binding = 22) readonly buffer CellData { uvec2 cellData[]; };
+layout(std430, binding = 24) readonly buffer LargeCells { uint largeCells[]; };
+layout(std430, binding = 28) readonly buffer CellStart { uint cellStart[]; };
+layout(std430, binding = 29) readonly buffer CellEnd { uint cellEnd[]; };
+layout(std430, binding = 32) buffer GradientTerms { float gradientTerms[]; };
+layout(std430, binding = 33) buffer SpeedOfSound { float speedOfSound[]; };
+layout(std430, binding = 34) buffer Balsara { float balsara[]; };
+layout(std430, binding = 38) buffer PAlphaLoc { float pAlphaLoc[]; };
+layout(std430, binding = 39) buffer LocalMaxH { float localMaxH[]; };
+layout(std430, binding = 40) buffer NextActiveTime { int nextActiveTime[]; };
+layout(std430, binding = 41) readonly buffer EosTables { vec4 eosTables[]; };
+layout(std430, binding = 42) readonly buffer EosMeta { ivec4 eosMeta[]; };
+layout(std430, binding = 44) readonly buffer ActiveFlags { uint activeFlags[]; };
+layout(std430, binding = 46) buffer RhoGrads { vec4 rhoGrads[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+} pc;
+
+float W(float r, float h) {
+    float H1 = (1.0 / h) * GAMMA1;
+    float u = r * H1;
+    if (u > 1.0) return 0.0;
+    float u2 = u * u;
+    float u3 = u2 * u;
+    float fac = KERNEL_CONSTANT * H1 * H1 * H1;
+    if (u > 0.5) return fac * (-u3 + 3.0 * u2 - 3.0 * u + 1.0);
+    return fac * (3.0 * u3 - 3.0 * u2 + 0.5);
+}
+
+float WFast(float r, float H1, float fac) {
+    float u = r * H1;
+    if (u > 1.0) return 0.0;
+    float u2 = u * u;
+    float u3 = u2 * u;
+    if (u > 0.5) return fac * (-u3 + 3.0 * u2 - 3.0 * u + 1.0);
+    return fac * (3.0 * u3 - 3.0 * u2 + 0.5);
+}
+
+float dWdhFast(float r, float H1, float fac) {
+    float u = r * H1;
+    if (u > 1.0) return 0.0;
+    float u2 = u * u;
+    float u3 = u2 * u;
+    if (u > 0.5) return -fac * (-6.0 * u3 + 15.0 * u2 - 12.0 * u + 3.0);
+    return -fac * (18.0 * u3 - 15.0 * u2 + 1.5);
+}
+
+vec3 gradW(vec3 xij, float r, float invR, float H1, float fac) {
+    float u = r * H1;
+    if (u > 1.0 || r <= 1e-12) return vec3(0.0);
+    float u2 = u * u;
+    vec3 rhat = xij * invR;
+    if (u > 0.5) return fac * (-3.0 * u2 + 6.0 * u - 3.0) * rhat;
+    return fac * (9.0 * u2 - 6.0 * u) * rhat;
+}
+
+uint splitBy3(uint a) {
+    uint x = a & 0x000003ffu;
+    x = (x | (x << 16)) & 0x030000FFu;
+    x = (x | (x << 8)) & 0x0300F00Fu;
+    x = (x | (x << 4)) & 0x030C30C3u;
+    x = (x | (x << 2)) & 0x09249249u;
+    return x;
+}
+
+uint morton3D(uint x, uint y, uint z) {
+    return splitBy3(x) | (splitBy3(y) << 1) | (splitBy3(z) << 2);
+}
+
+uint cellPositionToIndex(ivec3 pos) {
+    int mask = (1 << CELL_POWER) - 1;
+    ivec3 modded = ivec3(pos.x & mask, pos.y & mask, pos.z & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+uint cellPositionToLargeBoundIndex(ivec3 pos) {
+    int mask = (1 << 10) - 1;
+    ivec3 modded = ivec3((pos.x >> 4) & mask, (pos.y >> 4) & mask, (pos.z >> 4) & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+float safeLogCoord(float value, float lo, float hi) {
+    value = max(value, 1.17549435e-38);
+    return clamp(log(value / lo) / log(hi / lo), 0.0, 1.0);
+}
+
+vec4 sampleEosTable(int tableIndex, float u, float v) {
+    ivec4 meta = eosMeta[tableIndex];
+    int offset = meta.x;
+    int resolution = meta.y;
+    if (resolution <= 1) return vec4(0.0, 1.0, 0.0, 0.0);
+    float x = clamp(u, 0.0, 1.0) * float(resolution - 1);
+    float y = clamp(v, 0.0, 1.0) * float(resolution - 1);
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, resolution - 1);
+    int y1 = min(y0 + 1, resolution - 1);
+    float tx = x - float(x0);
+    float ty = y - float(y0);
+    vec4 a = mix(eosTables[offset + y0 * resolution + x0], eosTables[offset + y0 * resolution + x1], tx);
+    vec4 b = mix(eosTables[offset + y1 * resolution + x0], eosTables[offset + y1 * resolution + x1], tx);
+    return mix(a, b, ty);
+}
+
+vec4 eosSample(int materialId, float u, float rho) {
+    if (materialId == 200) return sampleEosTable(3, clamp(log(max(u, 1.17549435e-38) / 1e-8) / log(5e9 / 1e4), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-7) / log(1000.0 / 0.1), 0.0, 1.0));
+    if (materialId == 201) return sampleEosTable(4, clamp(log(max(u, 1.17549435e-38) / 1e-9) / log(5e9 / 1e3), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-6) / log(6000.0 / 1.0), 0.0, 1.0));
+    if (materialId == 202) return sampleEosTable(5, clamp(log(max(u, 1.17549435e-38) / 1e-8) / log(1e9 / 1e4), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-6) / log(20000.0 / 1.0), 0.0, 1.0));
+    if (materialId == 400) return sampleEosTable(1, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    if (materialId == 401) return sampleEosTable(0, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    if (materialId == 402) return sampleEosTable(2, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    return vec4(0.0, 1.0, 0.0, rho);
+}
+
+float apparentDensity(int materialId, float T, float p) {
+    if (materialId == 200) return sampleEosTable(3, clamp(log(max(T, 1.17549435e-38) / 1e-8) / log(5e9 / 1e4), 0.0, 1.0), clamp(log(max(p, 1.17549435e-38) / 1e-7) / log(1000.0 / 0.1), 0.0, 1.0)).w;
+    if (materialId == 201) return sampleEosTable(4, clamp(log(max(T, 1.17549435e-38) / 1e-9) / log(5e9 / 1e3), 0.0, 1.0), clamp(log(max(p, 1.17549435e-38) / 1e-6) / log(6000.0 / 1.0), 0.0, 1.0)).w;
+    if (materialId == 202) return sampleEosTable(5, clamp(log(max(T, 1.17549435e-38) / 1e-8) / log(1e9 / 1e4), 0.0, 1.0), clamp(log(max(p, 1.17549435e-38) / 1e-6) / log(20000.0 / 1.0), 0.0, 1.0)).w;
+    if (materialId == 400) return sampleEosTable(1, safeLogCoord(p, 1e-7, 1e-3), safeLogCoord(T, 5e2, 1e5)).w;
+    if (materialId == 401) return sampleEosTable(0, safeLogCoord(p, 1e-7, 1e-3), safeLogCoord(T, 5e2, 1e5)).w;
+    if (materialId == 402) return sampleEosTable(2, safeLogCoord(p, 1e-7, 1e-3), safeLogCoord(T, 5e2, 1e5)).w;
+    return 1.0;
+}
+
+float findDensityFactor(int materialA, int materialB, float T, float p) {
+    if (materialA < 400 || materialB < 400) return 1.0;
+    if (materialA == materialB) return 1.0;
+    float trueRho = apparentDensity(materialB, T, p);
+    if (abs(trueRho) < 1e-30) return 1.0;
+    return apparentDensity(materialA, T, p) / trueRho;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles)) return;
+    uint ind = cellData[i].y;
+    if (alive[ind] == 0u) return;
+    if (activeFlags[ind] == 0u) {
+        vec4 inactivePc = eosSample(materialIds[ind], internalEnergy[ind], densities[ind]);
+        pressures[ind] = inactivePc.x;
+        speedOfSound[ind] = inactivePc.y;
+        temperatures[ind] = inactivePc.z;
+        return;
+    }
+
+    vec3 p = positions[ind].xyz;
+    float h = smoothingLengths[ind];
+    float rho = densities[ind];
+    float omega = 1.0;
+    float minBound = 0.0;
+    float maxBound = MAX_SMOOTHING_LENGTH;
+    uint neighbourIndex[N_NEIGHBOURS_ESTIM];
+    float neighbourR[N_NEIGHBOURS_ESTIM];
+    int nNeighbours = 1;
+    neighbourIndex[0] = ind;
+    neighbourR[0] = 0.0;
+    for (int iter = 0; iter < MAX_DENSITY_NR_ITERATIONS; ++iter) {
+        float support = GAMMA * h;
+        float support2 = support * support;
+        float H1 = GAMMA1 / h;
+        float kernelFac = KERNEL_CONSTANT * H1 * H1 * H1;
+        float dhKernelFac = kernelFac * H1;
+        float density = 0.0;
+        float densityH = 0.0;
+        int particlesInRange = 0;
+        nNeighbours = 1;
+        ivec3 cminNr = ivec3(floor((p - vec3(support)) / CELL_WIDTH));
+        ivec3 cmaxNr = ivec3(floor((p + vec3(support)) / CELL_WIDTH));
+        for (int x = cminNr.x; x <= cmaxNr.x; ++x) {
+            for (int y = cminNr.y; y <= cmaxNr.y; ++y) {
+                for (int z = cminNr.z; z <= cmaxNr.z; ++z) {
+                    ivec3 cellPos = ivec3(x, y, z);
+                    uint cell = cellPositionToIndex(cellPos);
+                    uint start = cellStart[cell];
+                    if (start == 0xFFFFFFFFu) continue;
+                    vec3 cellMin = vec3(cellPos) * CELL_WIDTH;
+                    vec3 cellMax = cellMin + vec3(CELL_WIDTH);
+                    vec3 distToCell = clamp(p, cellMin, cellMax) - p;
+                    if (dot(distToCell, distToCell) > support2) continue;
+                    uint large = cellPositionToLargeBoundIndex(cellPos);
+                    uint end = cellEnd[cell] + 1u;
+                    for (uint k = start; k < end; ++k) {
+                        uint j = cellData[k].y;
+                        if (alive[j] == 0u || largeCells[j] != large) continue;
+                        vec3 xij = positions[j].xyz - p;
+                        float r2 = dot(xij, xij);
+                        if (r2 > support) continue;
+                        float r = sqrt(r2);
+                        if (nNeighbours < N_NEIGHBOURS_ESTIM) {
+                            neighbourIndex[nNeighbours] = j;
+                            neighbourR[nNeighbours] = r;
+                            nNeighbours++;
+                        }
+                        float densityFactor = findDensityFactor(materialIds[ind], materialIds[j], temperatures[j], pressures[j]);
+                        float mass = densityFactor * masses[j];
+                        density += WFast(r, H1, kernelFac) * mass;
+                        densityH += mass * dWdhFast(r, H1, dhKernelFac);
+                        particlesInRange++;
+                    }
+                }
+            }
+        }
+        omega = 1.0 + densityH * h / (3.0 * density);
+        float etaH = RESOLUTION_ETA / h;
+        float eta = masses[ind] * etaH * etaH * etaH - density;
+        float newH = clamp(h * (1.0 + eta / (3.0 * density * omega)), 1e-12, MAX_SMOOTHING_LENGTH);
+        if (particlesInRange < PARTICLE_IN_RANGE_THRESHOLD) {
+            newH = min(max(newH, h * 2.0), MAX_SMOOTHING_LENGTH);
+        }
+        if (newH < h) maxBound = h;
+        else minBound = h;
+        if (newH < minBound || newH > maxBound) newH = 0.5 * (minBound + maxBound);
+        float eps = abs(newH - h) / h;
+        h = newH;
+        rho = density;
+        if (eps <= DENSITY_ETA) break;
+    }
+
+    float support = GAMMA * h;
+    float support2 = support * support;
+    float unscaledDensity = 0.0;
+    vec3 rhoGrad = vec3(0.0);
+    vec3 velCurl = vec3(0.0);
+    float velDiv = 0.0;
+    float accDiv = 0.0;
+    int finalNeighbours = 0;
+    mat3 mMatrix = mat3(0.0);
+    float localMax = h;
+    float H1 = GAMMA1 / h;
+    float kernelFac = KERNEL_CONSTANT * H1 * H1 * H1;
+    float gradFac = kernelFac * H1;
+    if (nNeighbours < N_NEIGHBOURS_ESTIM) {
+        for (int ni = 0; ni < nNeighbours; ++ni) {
+            uint j = neighbourIndex[ni];
+            float r = neighbourR[ni];
+            if (r > support) continue;
+            float wij = WFast(r, H1, kernelFac);
+            unscaledDensity += masses[j] * wij;
+            finalNeighbours++;
+            if (r <= 1e-12) continue;
+            vec3 xij = positions[j].xyz - p;
+            vec3 vij = velocities[j].xyz - velocities[ind].xyz;
+            vec3 gW = gradW(xij, r, 1.0 / r, H1, gradFac);
+            velDiv += masses[j] * dot(vij, gW);
+            velCurl += masses[j] * cross(vij, gW);
+            mMatrix += -masses[j] * outerProduct(vij, gW);
+            accDiv += masses[j] * dot(accelerations[j].xyz - accelerations[ind].xyz, gW);
+            localMax = max(localMax, smoothingLengths[j]);
+            vec3 prevGrad = rhoGrads[j].xyz;
+            if (any(isnan(prevGrad)) || any(isinf(prevGrad))) {
+                rhoGrad += masses[j] * rho * gW;
+            } else {
+                rhoGrad += 0.25 * masses[j] * (rho * gW + 3.0 * prevGrad * wij);
+            }
+        }
+    } else {
+        ivec3 cmin = ivec3(floor((p - vec3(support)) / CELL_WIDTH));
+        ivec3 cmax = ivec3(floor((p + vec3(support)) / CELL_WIDTH));
+        for (int x = cmin.x; x <= cmax.x; ++x) {
+            for (int y = cmin.y; y <= cmax.y; ++y) {
+                for (int z = cmin.z; z <= cmax.z; ++z) {
+                    ivec3 cellPos = ivec3(x, y, z);
+                    uint cell = cellPositionToIndex(cellPos);
+                    uint start = cellStart[cell];
+                    if (start == 0xFFFFFFFFu) continue;
+                    uint end = cellEnd[cell] + 1u;
+                    for (uint k = start; k < end; ++k) {
+                        uint j = cellData[k].y;
+                        if (alive[j] == 0u) continue;
+                        vec3 xij = positions[j].xyz - p;
+                        float r2 = dot(xij, xij);
+                        if (r2 > support2) continue;
+                        float r = sqrt(r2);
+                        float wij = WFast(r, H1, kernelFac);
+                        unscaledDensity += masses[j] * wij;
+                        finalNeighbours++;
+                        localMax = max(localMax, smoothingLengths[j]);
+                        if (r <= 1e-12) continue;
+                        vec3 vij = velocities[j].xyz - velocities[ind].xyz;
+                        vec3 gW = gradW(xij, r, 1.0 / r, H1, gradFac);
+                        velDiv += masses[j] * dot(vij, gW);
+                        velCurl += masses[j] * cross(vij, gW);
+                        mMatrix += -masses[j] * outerProduct(vij, gW);
+                        accDiv += masses[j] * dot(accelerations[j].xyz - accelerations[ind].xyz, gW);
+                        vec3 prevGrad = rhoGrads[j].xyz;
+                        if (any(isnan(prevGrad)) || any(isinf(prevGrad))) {
+                            rhoGrad += masses[j] * rho * gW;
+                        } else {
+                            rhoGrad += 0.25 * masses[j] * (rho * gW + 3.0 * prevGrad * wij);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    densities[ind] = rho;
+    rhoGrads[ind] = vec4(rho > 0.0 ? rhoGrad / rho : vec3(0.0), 0.0);
+    vec4 pcv = eosSample(materialIds[ind], internalEnergy[ind], rho);
+    pressures[ind] = pcv.x;
+    speedOfSound[ind] = pcv.y;
+    temperatures[ind] = pcv.z;
+    smoothingLengths[ind] = h;
+    float absCurl = unscaledDensity > 0.0 ? length(velCurl) / unscaledDensity : 0.0;
+    velDiv = unscaledDensity > 0.0 ? velDiv / unscaledDensity : 0.0;
+    balsara[ind] = abs(velDiv) / (abs(velDiv) + absCurl + 1e-4 * (pcv.y / h));
+    gradientTerms[ind] = 1.0 / omega;
+    float sum = 0.0;
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) sum += mMatrix[a][b] * mMatrix[b][a];
+    }
+    if (nNeighbours > 5) {
+        float S = 10.0 * h * h * max(0.0, -1.0 * (accDiv - sum) / unscaledDensity);
+        pAlphaLoc[ind] = clamp(ALPHA_MAX * S / (pcv.y * pcv.y + S), ALPHA_MIN, ALPHA_MAX);
+    } else {
+        pAlphaLoc[ind] = ALPHA_MIN;
+    }
+    localMaxH[ind] = localMax;
+}

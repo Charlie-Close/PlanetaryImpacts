@@ -1,0 +1,100 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 2) readonly buffer Densities { float densities[]; };
+layout(std430, binding = 3) readonly buffer InternalEnergy { float internalEnergy[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) readonly buffer SmoothingLengths { float smoothingLengths[]; };
+layout(std430, binding = 6) readonly buffer Pressures { float pressures[]; };
+layout(std430, binding = 7) readonly buffer MaterialIds { int materialIds[]; };
+layout(std430, binding = 8) readonly buffer Temperatures { float temperatures[]; };
+layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
+layout(std430, binding = 10) readonly buffer Accelerations { vec4 accelerations[]; };
+layout(std430, binding = 11) readonly buffer GravAccelerations { vec4 gravAccelerations[]; };
+layout(std430, binding = 12) readonly buffer DInternalEnergy { float dInternalEnergy[]; };
+layout(std430, binding = 13) readonly buffer DhDt { float dhDt[]; };
+layout(std430, binding = 21) readonly buffer GravAbs { float gravAbs[]; };
+layout(std430, binding = 22) readonly buffer CellData { uvec2 cellData[]; };
+layout(std430, binding = 30) readonly buffer Accelerations1 { vec4 accelerations1[]; };
+layout(std430, binding = 31) readonly buffer DInternalEnergy1 { float dInternalEnergy1[]; };
+layout(std430, binding = 32) readonly buffer GradientTerms { float gradientTerms[]; };
+layout(std430, binding = 33) readonly buffer SpeedOfSound { float speedOfSound[]; };
+layout(std430, binding = 34) readonly buffer Balsara { float balsara[]; };
+layout(std430, binding = 35) readonly buffer Alpha { float alpha[]; };
+layout(std430, binding = 36) readonly buffer DaDt { float daDt[]; };
+layout(std430, binding = 37) readonly buffer AlphaLoc { float alphaLoc[]; };
+layout(std430, binding = 38) readonly buffer PAlphaLoc { float pAlphaLoc[]; };
+layout(std430, binding = 39) readonly buffer LocalMaxH { float localMaxH[]; };
+layout(std430, binding = 40) readonly buffer NextActiveTime { int nextActiveTime[]; };
+layout(std430, binding = 46) readonly buffer RhoGrads { vec4 rhoGrads[]; };
+layout(std430, binding = 74) readonly buffer ParticleIds { int particleIds[]; };
+
+layout(std430, binding = 47) writeonly buffer OutPositions { vec4 outPositions[]; };
+layout(std430, binding = 48) writeonly buffer OutVelocities { vec4 outVelocities[]; };
+layout(std430, binding = 49) writeonly buffer OutDensities { float outDensities[]; };
+layout(std430, binding = 50) writeonly buffer OutInternalEnergy { float outInternalEnergy[]; };
+layout(std430, binding = 51) writeonly buffer OutMasses { float outMasses[]; };
+layout(std430, binding = 52) writeonly buffer OutSmoothingLengths { float outSmoothingLengths[]; };
+layout(std430, binding = 53) writeonly buffer OutPressures { float outPressures[]; };
+layout(std430, binding = 54) writeonly buffer OutMaterialIds { int outMaterialIds[]; };
+layout(std430, binding = 55) writeonly buffer OutTemperatures { float outTemperatures[]; };
+layout(std430, binding = 56) writeonly buffer OutAlive { uint outAlive[]; };
+layout(std430, binding = 57) writeonly buffer OutAccelerations { vec4 outAccelerations[]; };
+layout(std430, binding = 58) writeonly buffer OutGravAccelerations { vec4 outGravAccelerations[]; };
+layout(std430, binding = 59) writeonly buffer OutDInternalEnergy { float outDInternalEnergy[]; };
+layout(std430, binding = 60) writeonly buffer OutDhDt { float outDhDt[]; };
+layout(std430, binding = 61) writeonly buffer OutGravAbs { float outGravAbs[]; };
+layout(std430, binding = 62) writeonly buffer OutAccelerations1 { vec4 outAccelerations1[]; };
+layout(std430, binding = 63) writeonly buffer OutDInternalEnergy1 { float outDInternalEnergy1[]; };
+layout(std430, binding = 64) writeonly buffer OutGradientTerms { float outGradientTerms[]; };
+layout(std430, binding = 65) writeonly buffer OutRhoGrads { vec4 outRhoGrads[]; };
+layout(std430, binding = 66) writeonly buffer OutSpeedOfSound { float outSpeedOfSound[]; };
+layout(std430, binding = 67) writeonly buffer OutBalsara { float outBalsara[]; };
+layout(std430, binding = 68) writeonly buffer OutAlpha { float outAlpha[]; };
+layout(std430, binding = 69) writeonly buffer OutDaDt { float outDaDt[]; };
+layout(std430, binding = 70) writeonly buffer OutAlphaLoc { float outAlphaLoc[]; };
+layout(std430, binding = 71) writeonly buffer OutPAlphaLoc { float outPAlphaLoc[]; };
+layout(std430, binding = 72) writeonly buffer OutLocalMaxH { float outLocalMaxH[]; };
+layout(std430, binding = 73) writeonly buffer OutNextActiveTime { int outNextActiveTime[]; };
+layout(std430, binding = 75) writeonly buffer OutParticleIds { int outParticleIds[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles)) return;
+    uint src = cellData[i].y;
+    outPositions[i] = positions[src];
+    outVelocities[i] = velocities[src];
+    outDensities[i] = densities[src];
+    outInternalEnergy[i] = internalEnergy[src];
+    outMasses[i] = masses[src];
+    outSmoothingLengths[i] = smoothingLengths[src];
+    outPressures[i] = pressures[src];
+    outMaterialIds[i] = materialIds[src];
+    outTemperatures[i] = temperatures[src];
+    outAlive[i] = alive[src];
+    outAccelerations[i] = accelerations[src];
+    outGravAccelerations[i] = gravAccelerations[src];
+    outDInternalEnergy[i] = dInternalEnergy[src];
+    outDhDt[i] = dhDt[src];
+    outGravAbs[i] = gravAbs[src];
+    outAccelerations1[i] = accelerations1[src];
+    outDInternalEnergy1[i] = dInternalEnergy1[src];
+    outGradientTerms[i] = gradientTerms[src];
+    outRhoGrads[i] = rhoGrads[src];
+    outSpeedOfSound[i] = speedOfSound[src];
+    outBalsara[i] = balsara[src];
+    outAlpha[i] = alpha[src];
+    outDaDt[i] = daDt[src];
+    outAlphaLoc[i] = alphaLoc[src];
+    outPAlphaLoc[i] = pAlphaLoc[src];
+    outLocalMaxH[i] = localMaxH[src];
+    outNextActiveTime[i] = nextActiveTime[src];
+    outParticleIds[i] = particleIds[src];
+}

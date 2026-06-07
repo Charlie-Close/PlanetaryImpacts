@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+const int SORTING_BUCKET_NUMBER = 256;
+const int SORTING_BIT_MASK = 255;
+
+layout(std430, binding = 25) buffer BucketHist { uint bucketHist[]; };
+layout(std430, binding = 26) buffer BucketOffset { uint bucketOffset[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+} pc;
+
+void main() {
+    uint bucket = gl_GlobalInvocationID.x;
+    if (bucket >= SORTING_BUCKET_NUMBER) return;
+    uint count = 0u;
+    for (int block = 0; block < pc.workItems; ++block) {
+        uint idx = uint(block) * SORTING_BUCKET_NUMBER + bucket;
+        count += bucketHist[idx];
+        bucketHist[idx] = count;
+    }
+    if (bucket < SORTING_BIT_MASK) bucketOffset[bucket + 1u] = count;
+    else bucketOffset[0] = 0u;
+}

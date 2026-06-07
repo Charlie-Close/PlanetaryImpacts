@@ -1,0 +1,206 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const float GAMMA = 1.825742;
+const float VISCOSITY_ALPHA = 1.5;
+const float VISCOSITY_BETA = 3.0;
+const float ALPHA_MIN = 0.1;
+const float ALPHA_MAX = 2.0;
+const float MAX_SMOOTHING_LENGTH = 1.0;
+const float CELL_WIDTH = 0.15;
+const int CELL_POWER = 7;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 2) readonly buffer Densities { float densities[]; };
+layout(std430, binding = 3) readonly buffer InternalEnergy { float internalEnergy[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) readonly buffer SmoothingLengths { float smoothingLengths[]; };
+layout(std430, binding = 6) readonly buffer Pressures { float pressures[]; };
+layout(std430, binding = 7) readonly buffer MaterialIds { int materialIds[]; };
+layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
+layout(std430, binding = 10) readonly buffer Accelerations { vec4 accelerations[]; };
+layout(std430, binding = 11) readonly buffer GravAccelerations { vec4 gravAccelerations[]; };
+layout(std430, binding = 12) readonly buffer DInternalEnergy { float dInternalEnergy[]; };
+layout(std430, binding = 13) readonly buffer DhDt { float dhDt[]; };
+layout(std430, binding = 22) readonly buffer CellData { uvec2 cellData[]; };
+layout(std430, binding = 24) readonly buffer LargeCells { uint largeCells[]; };
+layout(std430, binding = 28) readonly buffer CellStart { uint cellStart[]; };
+layout(std430, binding = 29) readonly buffer CellEnd { uint cellEnd[]; };
+layout(std430, binding = 30) buffer Accelerations1 { vec4 accelerations1[]; };
+layout(std430, binding = 31) buffer DInternalEnergy1 { float dInternalEnergy1[]; };
+layout(std430, binding = 32) readonly buffer GradientTerms { float gradientTerms[]; };
+layout(std430, binding = 33) readonly buffer SpeedOfSound { float speedOfSound[]; };
+layout(std430, binding = 34) readonly buffer Balsara { float balsara[]; };
+layout(std430, binding = 35) readonly buffer Alpha { float alpha[]; };
+layout(std430, binding = 36) readonly buffer DaDt { float daDt[]; };
+layout(std430, binding = 37) readonly buffer AlphaLoc { float alphaLoc[]; };
+layout(std430, binding = 39) readonly buffer LocalMaxH { float localMaxH[]; };
+layout(std430, binding = 40) readonly buffer NextActiveTime { int nextActiveTime[]; };
+layout(std430, binding = 41) readonly buffer EosTables { vec4 eosTables[]; };
+layout(std430, binding = 42) readonly buffer EosMeta { ivec4 eosMeta[]; };
+layout(std430, binding = 44) readonly buffer ActiveFlags { uint activeFlags[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+} pc;
+
+uint splitBy3(uint a) {
+    uint x = a & 0x000003ffu;
+    x = (x | (x << 16)) & 0x030000FFu;
+    x = (x | (x << 8)) & 0x0300F00Fu;
+    x = (x | (x << 4)) & 0x030C30C3u;
+    x = (x | (x << 2)) & 0x09249249u;
+    return x;
+}
+
+uint morton3D(uint x, uint y, uint z) {
+    return splitBy3(x) | (splitBy3(y) << 1) | (splitBy3(z) << 2);
+}
+
+uint cellPositionToIndex(ivec3 pos) {
+    int mask = (1 << CELL_POWER) - 1;
+    ivec3 modded = ivec3(pos.x & mask, pos.y & mask, pos.z & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+uint cellPositionToLargeBoundIndex(ivec3 pos) {
+    int mask = (1 << 10) - 1;
+    ivec3 modded = ivec3((pos.x >> 4) & mask, (pos.y >> 4) & mask, (pos.z >> 4) & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+vec3 gradW(vec3 xij, float r, float h) {
+    if (r < 1e-12) return vec3(0.0);
+    float H1 = (1.0 / h) / GAMMA;
+    float u = r * H1;
+    if (u > 1.0) return vec3(0.0);
+    float u2 = u * u;
+    float fac = 16.0 / 3.14159265358979323846 * H1 * H1 * H1 * H1;
+    vec3 rhat = xij / r;
+    if (u > 0.5) return fac * (-3.0 * u2 + 6.0 * u - 3.0) * rhat;
+    return fac * (9.0 * u2 - 6.0 * u) * rhat;
+}
+
+float safeLogCoord(float value, float lo, float hi) {
+    value = max(value, 1.17549435e-38);
+    return clamp(log(value / lo) / log(hi / lo), 0.0, 1.0);
+}
+
+vec4 sampleEosTable(int tableIndex, float u, float v) {
+    ivec4 meta = eosMeta[tableIndex];
+    int offset = meta.x;
+    int resolution = meta.y;
+    if (resolution <= 1) return vec4(0.0, 1.0, 0.0, 0.0);
+    float x = clamp(u, 0.0, 1.0) * float(resolution - 1);
+    float y = clamp(v, 0.0, 1.0) * float(resolution - 1);
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, resolution - 1);
+    int y1 = min(y0 + 1, resolution - 1);
+    float tx = x - float(x0);
+    float ty = y - float(y0);
+    vec4 a = mix(eosTables[offset + y0 * resolution + x0], eosTables[offset + y0 * resolution + x1], tx);
+    vec4 b = mix(eosTables[offset + y1 * resolution + x0], eosTables[offset + y1 * resolution + x1], tx);
+    return mix(a, b, ty);
+}
+
+vec4 eosSample(int materialId, float u, float rho) {
+    if (materialId == 200) return sampleEosTable(3, clamp(log(max(u, 1.17549435e-38) / 1e-8) / log(5e9 / 1e4), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-7) / log(1000.0 / 0.1), 0.0, 1.0));
+    if (materialId == 201) return sampleEosTable(4, clamp(log(max(u, 1.17549435e-38) / 1e-9) / log(5e9 / 1e3), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-6) / log(6000.0 / 1.0), 0.0, 1.0));
+    if (materialId == 202) return sampleEosTable(5, clamp(log(max(u, 1.17549435e-38) / 1e-8) / log(1e9 / 1e4), 0.0, 1.0), clamp(log(max(rho, 1.17549435e-38) / 1e-6) / log(20000.0 / 1.0), 0.0, 1.0));
+    if (materialId == 400) return sampleEosTable(1, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    if (materialId == 401) return sampleEosTable(0, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    if (materialId == 402) return sampleEosTable(2, safeLogCoord(u, 1e-10, 1.0), safeLogCoord(rho, 1e-6, 1.0));
+    return vec4(0.0, 1.0, 0.0, rho);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles)) return;
+    uint ind = cellData[i].y;
+    if (activeFlags[ind] == 0u) return;
+    if (alive[ind] == 0u) return;
+
+    float ownDt = pc.minDt * float(nextActiveTime[ind] - pc.globalTime);
+    float halfDt = 0.5 * ownDt;
+    vec3 a0 = accelerations[ind].xyz + gravAccelerations[ind].xyz;
+    vec3 p = positions[ind].xyz + halfDt * velocities[ind].xyz + 0.5 * halfDt * halfDt * a0;
+    vec3 v = velocities[ind].xyz + halfDt * a0;
+    float baseHI = smoothingLengths[ind];
+    float rhoI = densities[ind] * exp(-(3.0 / baseHI) * dhDt[ind] * halfDt);
+    float hI = clamp(baseHI * exp((1.0 / baseHI) * dhDt[ind] * halfDt), 1e-12, MAX_SMOOTHING_LENGTH);
+    float uI = max(internalEnergy[ind] + halfDt * dInternalEnergy[ind], 0.0);
+    vec4 eosI = eosSample(materialIds[ind], uI, rhoI);
+    float factI = gradientTerms[ind] * eosI.x / (rhoI * rhoI);
+    float cI = eosI.y;
+    float alphaI = clamp(alphaLoc[ind] + (alpha[ind] - alphaLoc[ind]) * exp(daDt[ind] * halfDt), ALPHA_MIN, ALPHA_MAX);
+    float BI = balsara[ind];
+    vec3 acc = vec3(0.0);
+    float du = 0.0;
+    float scanSupport = GAMMA * (halfDt * halfDt * length(a0) + localMaxH[ind]);
+    float maxScanRadius2 = GAMMA * GAMMA * localMaxH[ind] * localMaxH[ind];
+    float hISupport2 = GAMMA * GAMMA * hI * hI;
+    vec3 rangeCenter = positions[ind].xyz;
+    ivec3 cmin = ivec3(floor((rangeCenter - vec3(scanSupport)) / CELL_WIDTH));
+    ivec3 cmax = ivec3(floor((rangeCenter + vec3(scanSupport)) / CELL_WIDTH));
+    for (int x = cmin.x; x <= cmax.x; ++x) {
+        for (int y = cmin.y; y <= cmax.y; ++y) {
+            for (int z = cmin.z; z <= cmax.z; ++z) {
+                ivec3 cellPos = ivec3(x, y, z);
+                uint cell = cellPositionToIndex(cellPos);
+                uint start = cellStart[cell];
+                if (start == 0xFFFFFFFFu) continue;
+                vec3 cellMin = vec3(cellPos) * CELL_WIDTH;
+                vec3 cellMax = cellMin + vec3(CELL_WIDTH);
+                vec3 distToCell = clamp(p, cellMin, cellMax) - p;
+                if (dot(distToCell, distToCell) > maxScanRadius2) continue;
+                uint large = cellPositionToLargeBoundIndex(cellPos);
+                uint end = cellEnd[cell] + 1u;
+                for (uint k = start; k < end; ++k) {
+                    uint j = cellData[k].y;
+                    if (j == ind || alive[j] == 0u || largeCells[j] != large) continue;
+                    vec3 aj = accelerations[j].xyz + gravAccelerations[j].xyz;
+                    vec3 pj = positions[j].xyz + halfDt * velocities[j].xyz + 0.5 * halfDt * halfDt * aj;
+                    vec3 xij = p - pj;
+                    float r2 = dot(xij, xij);
+                    float baseHJ = smoothingLengths[j];
+                    float hJ = clamp(baseHJ * exp(dhDt[j] * halfDt / baseHJ), 1e-12, MAX_SMOOTHING_LENGTH);
+                    float hJSupport = GAMMA * hJ;
+                    if ((r2 > hISupport2 && r2 > hJSupport * hJSupport) || r2 < 1e-12) continue;
+                    float r = sqrt(r2);
+                    float rhoJ = densities[j] * exp(-(3.0 / baseHJ) * dhDt[j] * halfDt);
+                    float uJ = max(internalEnergy[j] + halfDt * dInternalEnergy[j], 0.0);
+                    vec4 eosJ = eosSample(materialIds[j], uJ, rhoJ);
+                    vec3 vj = velocities[j].xyz + halfDt * aj;
+                    vec3 vij = v - vj;
+                    float mu = dot(vij, xij) < 0.0 ? dot(vij, xij) / r : 0.0;
+                    float alphaJ = clamp(alphaLoc[j] + (alpha[j] - alphaLoc[j]) * exp(daDt[j] * halfDt), ALPHA_MIN, ALPHA_MAX);
+                    float vsig = cI + eosJ.y - VISCOSITY_BETA * mu;
+                    float nu = -0.25 * (alphaI + alphaJ) * (BI + balsara[j]) * mu * vsig / (rhoI + rhoJ);
+                    vec3 gWi = gradW(xij, r, hI);
+                    vec3 gWj = gradW(xij, r, hJ);
+                    vec3 visc = 0.5 * nu * (gWi + gWj);
+                    float factJ = gradientTerms[j] * eosJ.x / (rhoJ * rhoJ);
+                    vec3 sph = factI * gWi + factJ * gWj;
+                    acc -= masses[j] * (sph + visc);
+                    du += masses[j] * (factI * dot(vij, gWi) + 0.5 * dot(vij, visc));
+                }
+            }
+        }
+    }
+    accelerations1[ind] = vec4(acc, 0.0);
+    dInternalEnergy1[ind] = du;
+}

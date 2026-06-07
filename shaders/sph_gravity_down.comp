@@ -1,0 +1,532 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const int N_EXPANSION_TERMS = 20;
+const int MAX_LOCAL_UNCHECKED_POINTERS = 256;
+const int GRAVITY_MAX_RECURSION = 8;
+const float GAMMA = 1.825742;
+const float PLUMBER_EQUIVALENT = 3.0;
+const float GRAVITY_ETA = 0.001;
+const float GDT = 0.5;
+const float MAX_DT = 100.0;
+
+const int M = 0;
+const int X = 1;
+const int Y = 2;
+const int Z = 3;
+const int XX = 4;
+const int XY = 5;
+const int XZ = 6;
+const int YY = 7;
+const int YZ = 8;
+const int ZZ = 9;
+const int XXX = 10;
+const int XXY = 11;
+const int XXZ = 12;
+const int XYY = 13;
+const int XYZ = 14;
+const int XZZ = 15;
+const int YYY = 16;
+const int YYZ = 17;
+const int YZZ = 18;
+const int ZZZ = 19;
+
+const int binom3[4] = int[4](1, 3, 3, 1);
+
+struct Multipole {
+    vec4 pos;
+    vec4 minv;
+    vec4 maxv;
+    float size;
+    float expansion[N_EXPANSION_TERMS];
+    float power[4];
+    float minGrav;
+    float eta;
+    float pad0;
+    float pad1;
+};
+
+struct Local {
+    vec4 pos;
+    float expansion[N_EXPANSION_TERMS];
+};
+
+struct Derivatives {
+    float expansion[N_EXPANSION_TERMS];
+};
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) readonly buffer H { float smoothingLengths[]; };
+layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
+layout(std430, binding = 11) buffer GravAccelerations { vec4 gravAccelerations[]; };
+layout(std430, binding = 14) readonly buffer Tree { int tree[]; };
+layout(std430, binding = 15) readonly buffer Multipoles { Multipole multipoles[]; };
+layout(std430, binding = 16) buffer Locals { Local locals[]; };
+layout(std430, binding = 17) readonly buffer ParentIndexes { uint parentIndexes[]; };
+layout(std430, binding = 18) readonly buffer TreeLevel { int treeLevel[]; };
+layout(std430, binding = 19) buffer LocalGravA { int localGravA[]; };
+layout(std430, binding = 20) buffer LocalGravB { int localGravB[]; };
+layout(std430, binding = 21) buffer GravAbs { float gravAbs[]; };
+layout(std430, binding = 43) buffer StepTicks { int stepTicks[]; };
+layout(std430, binding = 45) buffer GravityStepTicks { int gravityStepTicks[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+    int cellTableSize;
+    int uncheckedParentStride;
+    int gravityLevelParity;
+    int dispatchOffset;
+} pc;
+
+float integer_powf(float x, int n) {
+    if (n == 0) return 1.0;
+    if (n == 1) return x;
+    if (n == 2) return x * x;
+    if (n == 3) return x * x * x;
+    return pow(x, float(n));
+}
+
+float D_soft_1(float u) {
+    float phi = -3.0 * u + 15.0;
+    phi = phi * u - 28.0;
+    phi = phi * u + 21.0;
+    phi = phi * u;
+    phi = phi * u - 7.0;
+    phi = phi * u;
+    phi = phi * u + 3.0;
+    return phi;
+}
+
+float D_soft_2(float u) {
+    float phi = -21.0 * u + 90.0;
+    phi = phi * u - 140.0;
+    phi = phi * u + 84.0;
+    phi = phi * u;
+    phi = phi * u - 14.0;
+    phi = phi * u;
+    return phi;
+}
+
+float D_soft_3(float u) {
+    float phi = -105.0 * u + 360.0;
+    phi = phi * u - 420.0;
+    phi = phi * u + 168.0;
+    phi = phi * u;
+    phi = phi * u;
+    return phi;
+}
+
+float D_soft_4(float u) {
+    float phi = -315.0 * u + 720.0;
+    phi = phi * u - 420.0;
+    phi = phi * u;
+    phi = phi * u;
+    return phi;
+}
+
+Derivatives derivatives(vec3 vec, float eps) {
+    float Dt1;
+    float Dt2;
+    float Dt3;
+    float Dt4;
+    float r2 = dot(vec, vec);
+    float r = sqrt(r2);
+    float rInv = r > 1e-6 ? 1.0 / r : 0.0;
+    float eps2 = eps * eps;
+    if (eps > 0.0 && r2 < eps2) {
+        float epsInv = 1.0 / eps;
+        float u = r * epsInv;
+        Dt1 = epsInv * D_soft_1(u);
+        float epsInv2 = epsInv * epsInv;
+        Dt2 = epsInv2 * D_soft_2(u);
+        float epsInv3 = epsInv2 * epsInv;
+        Dt3 = epsInv3 * D_soft_3(u);
+        float epsInv4 = epsInv3 * epsInv;
+        Dt4 = epsInv4 * D_soft_4(u);
+    } else {
+        Dt1 = rInv;
+        Dt2 = -Dt1 * rInv;
+        Dt3 = -3.0 * Dt2 * rInv;
+        Dt4 = -5.0 * Dt3 * rInv;
+    }
+
+    vec3 rr = vec * rInv;
+    vec3 rr2 = rr * rr;
+    vec3 rr3 = rr2 * rr;
+    Derivatives dev;
+    for (int i = 0; i < N_EXPANSION_TERMS; ++i) dev.expansion[i] = 0.0;
+    dev.expansion[M] = Dt1;
+    dev.expansion[X] = rr.x * Dt2;
+    dev.expansion[Y] = rr.y * Dt2;
+    dev.expansion[Z] = rr.z * Dt2;
+
+    Dt2 *= rInv;
+    dev.expansion[XX] = rr2.x * Dt3 + Dt2;
+    dev.expansion[XY] = rr.x * rr.y * Dt3;
+    dev.expansion[XZ] = rr.x * rr.z * Dt3;
+    dev.expansion[YY] = rr2.y * Dt3 + Dt2;
+    dev.expansion[YZ] = rr.y * rr.z * Dt3;
+    dev.expansion[ZZ] = rr2.z * Dt3 + Dt2;
+
+    Dt3 *= rInv;
+    dev.expansion[XXX] = rr3.x * Dt4 + 3.0 * rr.x * Dt3;
+    dev.expansion[YYY] = rr3.y * Dt4 + 3.0 * rr.y * Dt3;
+    dev.expansion[ZZZ] = rr3.z * Dt4 + 3.0 * rr.z * Dt3;
+    dev.expansion[XXY] = rr2.x * rr.y * Dt4 + rr.y * Dt3;
+    dev.expansion[XXZ] = rr2.x * rr.z * Dt4 + rr.z * Dt3;
+    dev.expansion[XYY] = rr2.y * rr.x * Dt4 + rr.x * Dt3;
+    dev.expansion[YYZ] = rr2.y * rr.z * Dt4 + rr.z * Dt3;
+    dev.expansion[XZZ] = rr2.z * rr.x * Dt4 + rr.x * Dt3;
+    dev.expansion[YZZ] = rr2.z * rr.y * Dt4 + rr.y * Dt3;
+    dev.expansion[XYZ] = rr.x * rr.y * rr.z * Dt4;
+    return dev;
+}
+
+float dphi_dr(vec3 xij, float eta) {
+    float r = length(xij);
+    if (r > eta || eta <= 0.0) return 1.0 / max(r * r, 1e-30);
+    float u = r / eta;
+    return D_soft_1(u) / (eta * eta);
+}
+
+bool m2lAccept(Multipole A, Multipole B) {
+    float rhoA = A.size;
+    float rhoB = B.size;
+    if (rhoA + rhoB < 1e-12) return true;
+    float r2 = dot(A.pos.xyz - B.pos.xyz, A.pos.xyz - B.pos.xyz);
+    float rhoSum = rhoA + rhoB;
+    if (rhoSum * rhoSum > r2) return false;
+    float rhoMax = max(rhoA, rhoB);
+    float e = 0.0;
+    for (int n = 0; n <= 3; ++n) e += float(binom3[n]) * B.power[n] * integer_powf(rhoA, 3 - n);
+    e *= 8.0 * rhoMax;
+    e /= rhoSum;
+    float rToP = integer_powf(r2, 1);
+    return e < GRAVITY_ETA * A.minGrav * rToP * r2;
+}
+
+bool m2pAccept(vec3 x, float prevGrav, Multipole B) {
+    float rhoB = B.size;
+    if (rhoB < 1e-12) return true;
+    float r2 = dot(x - B.pos.xyz, x - B.pos.xyz);
+    if (rhoB * rhoB > r2) return false;
+    float e = 8.0 * B.power[3];
+    float rToP = integer_powf(r2, 1);
+    return e < GRAVITY_ETA * prevGrav * rToP * r2;
+}
+
+void m2l(Multipole mp, inout Local local) {
+    vec3 r = local.pos.xyz - mp.pos.xyz;
+    Derivatives d = derivatives(r, mp.eta);
+    float M000 = mp.expansion[M];
+    local.expansion[M] += M000 * d.expansion[M];
+    local.expansion[X] += M000 * d.expansion[X];
+    local.expansion[Y] += M000 * d.expansion[Y];
+    local.expansion[Z] += M000 * d.expansion[Z];
+
+    float M200 = mp.expansion[XX], M020 = mp.expansion[YY], M002 = mp.expansion[ZZ];
+    float M110 = mp.expansion[XY], M101 = mp.expansion[XZ], M011 = mp.expansion[YZ];
+    local.expansion[M] += M200 * d.expansion[XX] + M020 * d.expansion[YY] + M002 * d.expansion[ZZ];
+    local.expansion[M] += M110 * d.expansion[XY] + M101 * d.expansion[XZ] + M011 * d.expansion[YZ];
+    local.expansion[XX] += M000 * d.expansion[XX];
+    local.expansion[YY] += M000 * d.expansion[YY];
+    local.expansion[ZZ] += M000 * d.expansion[ZZ];
+    local.expansion[XY] += M000 * d.expansion[XY];
+    local.expansion[XZ] += M000 * d.expansion[XZ];
+    local.expansion[YZ] += M000 * d.expansion[YZ];
+
+    float M300 = mp.expansion[XXX], M030 = mp.expansion[YYY], M003 = mp.expansion[ZZZ];
+    float M210 = mp.expansion[XXY], M201 = mp.expansion[XXZ], M021 = mp.expansion[YYZ];
+    float M120 = mp.expansion[XYY], M012 = mp.expansion[YZZ], M102 = mp.expansion[XZZ], M111 = mp.expansion[XYZ];
+    local.expansion[M] += M300 * d.expansion[XXX] + M030 * d.expansion[YYY] + M003 * d.expansion[ZZZ];
+    local.expansion[M] += M210 * d.expansion[XXY] + M201 * d.expansion[XXZ] + M120 * d.expansion[XYY];
+    local.expansion[M] += M021 * d.expansion[YYZ] + M102 * d.expansion[XZZ] + M012 * d.expansion[YZZ] + M111 * d.expansion[XYZ];
+    local.expansion[X] += M200 * d.expansion[XXX] + M020 * d.expansion[XYY] + M002 * d.expansion[XZZ];
+    local.expansion[X] += M110 * d.expansion[XXY] + M101 * d.expansion[XXZ] + M011 * d.expansion[XYZ];
+    local.expansion[Y] += M200 * d.expansion[XXY] + M020 * d.expansion[YYY] + M002 * d.expansion[YZZ];
+    local.expansion[Y] += M110 * d.expansion[XYY] + M101 * d.expansion[XYZ] + M011 * d.expansion[YYZ];
+    local.expansion[Z] += M200 * d.expansion[XXZ] + M020 * d.expansion[YYZ] + M002 * d.expansion[ZZZ];
+    local.expansion[Z] += M110 * d.expansion[XYZ] + M101 * d.expansion[XZZ] + M011 * d.expansion[YZZ];
+    local.expansion[XXX] += M000 * d.expansion[XXX];
+    local.expansion[YYY] += M000 * d.expansion[YYY];
+    local.expansion[ZZZ] += M000 * d.expansion[ZZZ];
+    local.expansion[XXY] += M000 * d.expansion[XXY];
+    local.expansion[XXZ] += M000 * d.expansion[XXZ];
+    local.expansion[XYY] += M000 * d.expansion[XYY];
+    local.expansion[YYZ] += M000 * d.expansion[YYZ];
+    local.expansion[XZZ] += M000 * d.expansion[XZZ];
+    local.expansion[YZZ] += M000 * d.expansion[YZZ];
+    local.expansion[XYZ] += M000 * d.expansion[XYZ];
+}
+
+vec3 l2p(Local local, vec3 pos) {
+    vec3 r = pos - local.pos.xyz;
+    vec3 acc = vec3(local.expansion[X], local.expansion[Y], local.expansion[Z]);
+    acc.x += r.x * local.expansion[XX] + r.y * local.expansion[XY] + r.z * local.expansion[XZ];
+    acc.y += r.x * local.expansion[XY] + r.y * local.expansion[YY] + r.z * local.expansion[YZ];
+    acc.z += r.x * local.expansion[XZ] + r.y * local.expansion[YZ] + r.z * local.expansion[ZZ];
+    acc.x += 0.5 * r.x * r.x * local.expansion[XXX] + 0.5 * r.y * r.y * local.expansion[XYY] + 0.5 * r.z * r.z * local.expansion[XZZ];
+    acc.x += r.x * r.y * local.expansion[XXY] + r.x * r.z * local.expansion[XXZ] + r.y * r.z * local.expansion[XYZ];
+    acc.y += 0.5 * r.x * r.x * local.expansion[XXY] + 0.5 * r.y * r.y * local.expansion[YYY] + 0.5 * r.z * r.z * local.expansion[YZZ];
+    acc.y += r.x * r.y * local.expansion[XYY] + r.x * r.z * local.expansion[XYZ] + r.y * r.z * local.expansion[YYZ];
+    acc.z += 0.5 * r.x * r.x * local.expansion[XXZ] + 0.5 * r.y * r.y * local.expansion[YYZ] + 0.5 * r.z * r.z * local.expansion[ZZZ];
+    acc.z += r.x * r.y * local.expansion[XYZ] + r.x * r.z * local.expansion[XZZ] + r.y * r.z * local.expansion[YZZ];
+    return acc;
+}
+
+vec3 m2p(Multipole mp, vec3 x) {
+    Local local;
+    local.pos = vec4(x, 0.0);
+    for (int i = 0; i < N_EXPANSION_TERMS; ++i) local.expansion[i] = 0.0;
+    m2l(mp, local);
+    return l2p(local, x);
+}
+
+Local transformLocal(Local local, vec3 r) {
+    Local outLocal = local;
+    outLocal.pos = vec4(local.pos.xyz + r, 0.0);
+    float x = r.x, y = r.y, z = r.z;
+    float x2 = x * x, y2 = y * y, z2 = z * z;
+    outLocal.expansion[M] += x * local.expansion[X] + y * local.expansion[Y] + z * local.expansion[Z];
+    outLocal.expansion[M] += 0.5 * x2 * local.expansion[XX] + 0.5 * y2 * local.expansion[YY] + 0.5 * z2 * local.expansion[ZZ];
+    outLocal.expansion[M] += x * y * local.expansion[XY] + x * z * local.expansion[XZ] + y * z * local.expansion[YZ];
+    outLocal.expansion[X] += x * local.expansion[XX] + y * local.expansion[XY] + z * local.expansion[XZ];
+    outLocal.expansion[Y] += x * local.expansion[XY] + y * local.expansion[YY] + z * local.expansion[YZ];
+    outLocal.expansion[Z] += x * local.expansion[XZ] + y * local.expansion[YZ] + z * local.expansion[ZZ];
+
+    float x3 = x2 * x, y3 = y2 * y, z3 = z2 * z;
+    outLocal.expansion[M] += (x3 / 6.0) * local.expansion[XXX] + (y3 / 6.0) * local.expansion[YYY] + (z3 / 6.0) * local.expansion[ZZZ];
+    outLocal.expansion[M] += 0.5 * x2 * y * local.expansion[XXY] + 0.5 * x2 * z * local.expansion[XXZ] + 0.5 * x * y2 * local.expansion[XYY];
+    outLocal.expansion[M] += 0.5 * y2 * z * local.expansion[YYZ] + 0.5 * x * z2 * local.expansion[XZZ] + 0.5 * y * z2 * local.expansion[YZZ];
+    outLocal.expansion[M] += x * y * z * local.expansion[XYZ];
+    outLocal.expansion[X] += 0.5 * x2 * local.expansion[XXX] + 0.5 * y2 * local.expansion[XYY] + 0.5 * z2 * local.expansion[XZZ];
+    outLocal.expansion[X] += x * y * local.expansion[XXY] + x * z * local.expansion[XXZ] + y * z * local.expansion[XYZ];
+    outLocal.expansion[Y] += 0.5 * x2 * local.expansion[XXY] + 0.5 * y2 * local.expansion[YYY] + 0.5 * z2 * local.expansion[YZZ];
+    outLocal.expansion[Y] += x * y * local.expansion[XYY] + x * z * local.expansion[XYZ] + y * z * local.expansion[YYZ];
+    outLocal.expansion[Z] += 0.5 * x2 * local.expansion[XXZ] + 0.5 * y2 * local.expansion[YYZ] + 0.5 * z2 * local.expansion[ZZZ];
+    outLocal.expansion[Z] += x * y * local.expansion[XYZ] + x * z * local.expansion[XZZ] + y * z * local.expansion[YZZ];
+    outLocal.expansion[XX] += x * local.expansion[XXX] + y * local.expansion[XXY] + z * local.expansion[XXZ];
+    outLocal.expansion[YY] += x * local.expansion[XYY] + y * local.expansion[YYY] + z * local.expansion[YYZ];
+    outLocal.expansion[ZZ] += x * local.expansion[XZZ] + y * local.expansion[YZZ] + z * local.expansion[ZZZ];
+    outLocal.expansion[XY] += x * local.expansion[XXY] + y * local.expansion[XYY] + z * local.expansion[XYZ];
+    outLocal.expansion[XZ] += x * local.expansion[XXZ] + y * local.expansion[XYZ] + z * local.expansion[XZZ];
+    outLocal.expansion[YZ] += x * local.expansion[XYZ] + y * local.expansion[YYZ] + z * local.expansion[YZZ];
+    return outLocal;
+}
+
+bool checkAndAddLocal(int toScan, Multipole mp, inout Local local, bool forceAccept) {
+    int nodeData = tree[toScan + 1];
+    Multipole nodeMp = multipoles[nodeData];
+    if (forceAccept || m2lAccept(mp, nodeMp)) {
+        m2l(nodeMp, local);
+        return true;
+    }
+    return false;
+}
+
+int readUnchecked(int idx) {
+    return pc.gravityLevelParity == 0 ? localGravA[idx] : localGravB[idx];
+}
+
+void writeUnchecked(int idx, int value) {
+    if (pc.gravityLevelParity == 0) localGravB[idx] = value;
+    else localGravA[idx] = value;
+}
+
+void zeroFirstBranches() {
+    for (int i = 2; i < 10; ++i) {
+        int nodePointer = tree[i];
+        if (nodePointer == -1) continue;
+        int nodeData = tree[nodePointer + 1];
+        locals[nodeData].pos = vec4(multipoles[nodeData].pos.xyz, 0.0);
+        for (int j = 0; j < N_EXPANSION_TERMS; ++j) locals[nodeData].expansion[j] = 0.0;
+    }
+    writeUnchecked(0, 0);
+    writeUnchecked(1, -1);
+}
+
+void nonRecursiveScan(Multipole mp, inout Local local, inout int outputPointer, int maxOutputPointer, int toScan, int treePointer) {
+    bool leaf = tree[toScan] != 0;
+    if (checkAndAddLocal(toScan, mp, local, leaf && outputPointer >= maxOutputPointer)) return;
+    if (leaf) {
+        if (outputPointer < maxOutputPointer) writeUnchecked(outputPointer, toScan);
+        outputPointer++;
+        return;
+    }
+    for (int j = toScan + 2; j < toScan + 10; ++j) {
+        int childPointer = tree[j];
+        if (childPointer == treePointer || childPointer == -1) continue;
+        if (!checkAndAddLocal(childPointer, mp, local, outputPointer >= maxOutputPointer)) {
+            if (outputPointer < maxOutputPointer) writeUnchecked(outputPointer, childPointer);
+            outputPointer++;
+        }
+    }
+}
+
+void recursiveScan(Multipole mp, inout Local local, int toScan, int treePointer, inout int uncheckedLeaves[MAX_LOCAL_UNCHECKED_POINTERS], inout int nUnchecked) {
+    bool leaf = tree[toScan] != 0;
+    if (checkAndAddLocal(toScan, mp, local, (nUnchecked >= MAX_LOCAL_UNCHECKED_POINTERS && leaf))) return;
+    if (leaf) {
+        if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) uncheckedLeaves[nUnchecked++] = toScan;
+        return;
+    }
+
+    int indexes[GRAVITY_MAX_RECURSION];
+    int ends[GRAVITY_MAX_RECURSION];
+    int currentDepth = 0;
+    indexes[0] = toScan + 2;
+    ends[0] = indexes[0] + 8;
+    int guard = 0;
+    while (indexes[0] < ends[0] && guard < 2000) {
+        guard++;
+        int nodePointer = tree[indexes[currentDepth]];
+        if (nodePointer == treePointer || nodePointer == -1) {
+            indexes[currentDepth]++;
+            while (indexes[currentDepth] == ends[currentDepth] && currentDepth != 0) {
+                currentDepth--;
+                indexes[currentDepth]++;
+            }
+            continue;
+        }
+        bool nodeLeaf = tree[nodePointer] != 0;
+        bool forceAccept = (nUnchecked >= MAX_LOCAL_UNCHECKED_POINTERS && nodeLeaf) || (!nodeLeaf && currentDepth == GRAVITY_MAX_RECURSION - 1);
+        if (!checkAndAddLocal(nodePointer, mp, local, forceAccept)) {
+            if (!nodeLeaf && currentDepth + 1 < GRAVITY_MAX_RECURSION) {
+                currentDepth++;
+                indexes[currentDepth] = nodePointer + 2;
+                ends[currentDepth] = indexes[currentDepth] + 8;
+                continue;
+            }
+            if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) uncheckedLeaves[nUnchecked++] = nodePointer;
+        }
+        indexes[currentDepth]++;
+        while (indexes[currentDepth] == ends[currentDepth] && currentDepth != 0) {
+            currentDepth--;
+            indexes[currentDepth]++;
+        }
+    }
+}
+
+void l2l(Multipole mp, Local local, int treePointer) {
+    for (int j = treePointer + 2; j < treePointer + 10; ++j) {
+        int nodePointer = tree[j];
+        if (nodePointer == -1) continue;
+        int nodeData = tree[nodePointer + 1];
+        Multipole nodeMp = multipoles[nodeData];
+        vec3 r = nodeMp.pos.xyz - local.pos.xyz;
+        locals[nodeData] = transformLocal(local, r);
+    }
+}
+
+void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, float curDt, int uncheckedLeaves[MAX_LOCAL_UNCHECKED_POINTERS], int nUnchecked) {
+    int start = treePointer + 2;
+    int end = start + nParticles;
+    for (int i = start; i < end; ++i) {
+        int particle = tree[i];
+        if (particle < 0 || particle >= pc.nParticles || alive[particle] == 0u) continue;
+        vec3 xi = positions[particle].xyz + 0.5 * curDt * velocities[particle].xyz;
+        vec3 acc = l2p(local, xi);
+        for (int j = start; j < end; ++j) {
+            if (i == j) continue;
+            int pj = tree[j];
+            if (pj < 0 || pj >= pc.nParticles || alive[pj] == 0u) continue;
+            vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
+            vec3 xij = xi - xj;
+            float r = length(xij);
+            if (r == 0.0) continue;
+            float eta = min(smoothingLengths[pj] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
+            acc -= masses[pj] * dphi_dr(xij, eta) * (xij / r);
+        }
+        for (int u = 0; u < nUnchecked; ++u) {
+            int nodePointer = uncheckedLeaves[u];
+            if (nodePointer < 0) break;
+            int dataPointer = tree[nodePointer + 1];
+            Multipole ump = multipoles[dataPointer];
+            if (m2pAccept(xi, 0.0, ump)) {
+                acc += m2p(ump, xi);
+                continue;
+            }
+            int np = tree[nodePointer];
+            if (np <= 0 || np > 8) continue;
+            for (int j = nodePointer + 2; j < nodePointer + 2 + np; ++j) {
+                int pj = tree[j];
+                if (pj < 0 || pj >= pc.nParticles || alive[pj] == 0u) continue;
+                vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
+                vec3 xij = xi - xj;
+                float r = length(xij);
+                if (r == 0.0) continue;
+                float eta = min(smoothingLengths[pj] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
+                acc -= masses[pj] * dphi_dr(xij, eta) * (xij / r);
+            }
+        }
+        vec3 grav = pc.gravityG * acc;
+        float gnorm = length(grav);
+        gravAccelerations[particle] = vec4(grav, 0.0);
+        gravAbs[particle] = gnorm / pc.gravityG;
+        float dtF = GDT * sqrt(smoothingLengths[particle] / max(gnorm, 1e-30));
+        float goalDt = clamp(dtF, pc.minDt, MAX_DT);
+        int integerDt = 1;
+        while (2.0 * pc.minDt * float(integerDt) < goalDt && 2.0 * pc.minDt * float(integerDt) < MAX_DT) {
+            integerDt += integerDt;
+        }
+        atomicMin(stepTicks[0], integerDt);
+        atomicMin(gravityStepTicks[0], integerDt);
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + uint(pc.dispatchOffset);
+    if (i >= uint(pc.workItems)) return;
+
+    int treePointer = treeLevel[pc.parentStride + int(i)];
+    if (treePointer < 0) return;
+    if (treePointer == 0) {
+        zeroFirstBranches();
+        return;
+    }
+
+    int dataPointer = tree[treePointer + 1];
+    Multipole mp = multipoles[dataPointer];
+    Local local = locals[dataPointer];
+    int nParticles = tree[treePointer];
+    if (nParticles < 0 || nParticles > 8) return;
+
+    int outputPointer = int(i) * pc.stride;
+    int maxOutputPointer = outputPointer + pc.stride;
+    if (nParticles == 0 && outputPointer < maxOutputPointer) {
+        writeUnchecked(outputPointer, treePointer);
+        outputPointer++;
+    }
+
+    uint parentIndex = parentIndexes[dataPointer];
+    int startScan = int(parentIndex) * pc.uncheckedParentStride;
+    int endScan = startScan + pc.uncheckedParentStride;
+    int localUncheckedPointers[MAX_LOCAL_UNCHECKED_POINTERS];
+    int nUnchecked = 0;
+    for (int s = startScan; s < endScan; ++s) {
+        int toScan = readUnchecked(s);
+        if (toScan == -1) break;
+        if (toScan < 0) continue;
+        if (nParticles != 0) recursiveScan(mp, local, toScan, treePointer, localUncheckedPointers, nUnchecked);
+        else nonRecursiveScan(mp, local, outputPointer, maxOutputPointer, toScan, treePointer);
+    }
+    if (outputPointer < maxOutputPointer && nParticles == 0) writeUnchecked(outputPointer, -1);
+    if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) localUncheckedPointers[nUnchecked] = -1;
+
+    if (nParticles == 0) l2l(mp, local, treePointer);
+    else localToLeaf(mp, local, treePointer, nParticles, pc.minDt * float(pc.stepTicks), localUncheckedPointers, nUnchecked);
+}

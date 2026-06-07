@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 2) buffer Densities { float densities[]; };
+layout(std430, binding = 3) buffer InternalEnergy { float internalEnergy[]; };
+layout(std430, binding = 5) buffer SmoothingLengths { float smoothingLengths[]; };
+layout(std430, binding = 9) buffer Alive { uint alive[]; };
+layout(std430, binding = 10) buffer Accelerations { vec4 accelerations[]; };
+layout(std430, binding = 11) readonly buffer GravAccelerations { vec4 gravAccelerations[]; };
+layout(std430, binding = 12) buffer DInternalEnergy { float dInternalEnergy[]; };
+layout(std430, binding = 13) buffer DhDt { float dhDt[]; };
+layout(std430, binding = 30) readonly buffer Accelerations1 { vec4 accelerations1[]; };
+layout(std430, binding = 31) readonly buffer DInternalEnergy1 { float dInternalEnergy1[]; };
+layout(std430, binding = 35) buffer Alpha { float alpha[]; };
+layout(std430, binding = 36) buffer DaDt { float daDt[]; };
+layout(std430, binding = 37) readonly buffer AlphaLoc { float alphaLoc[]; };
+layout(std430, binding = 43) readonly buffer StepTicks { int stepTicks[]; };
+layout(std430, binding = 44) readonly buffer ActiveFlags { uint activeFlags[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles) || alive[i] == 0u) return;
+    bool isActive = activeFlags[i] != 0u;
+    if (isActive) {
+        accelerations[i] = accelerations1[i];
+        dInternalEnergy[i] = dInternalEnergy1[i];
+    }
+    float dt = pc.minDt * float(stepTicks[0]);
+    vec3 a = (isActive ? accelerations1[i].xyz : accelerations[i].xyz) + gravAccelerations[i].xyz;
+    vec3 p = positions[i].xyz;
+    vec3 v = velocities[i].xyz;
+    p += v * dt + 0.5 * a * dt * dt;
+    v += a * dt;
+    float h = smoothingLengths[i];
+    float dh = dhDt[i];
+    smoothingLengths[i] = h * exp((dh / h) * dt);
+    densities[i] *= exp(-(3.0 / h) * dh * dt);
+    dhDt[i] *= smoothingLengths[i] / h;
+    internalEnergy[i] = max(internalEnergy[i] + dt * (isActive ? dInternalEnergy1[i] : dInternalEnergy[i]), 0.0);
+    float alphaI = alpha[i];
+    float alphaTarget = alphaLoc[i];
+    float dadt = daDt[i];
+    if (alphaI != alphaTarget && dadt > 1e-12) {
+        float tau = (alphaTarget - alphaI) / dadt;
+        alphaI = alphaTarget + (alphaI - alphaTarget) * exp(dadt * dt);
+        daDt[i] = (alphaTarget - alphaI) / tau;
+        alpha[i] = clamp(alphaI, 0.1, 2.0);
+    }
+    vec3 translated = p - vec3(pc.boxCenter);
+    if (max(max(abs(translated.x), abs(translated.y)), abs(translated.z)) > pc.boxSize) {
+        alive[i] = 0u;
+    }
+    positions[i] = vec4(p, 0.0);
+    velocities[i] = vec4(v, 0.0);
+}

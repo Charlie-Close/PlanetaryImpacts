@@ -1,0 +1,198 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const float GAMMA = 1.825742;
+const float GAMMA1 = 1.0 / GAMMA;
+const float KERNEL_CONSTANT = 16.0 / 3.14159265358979323846;
+const float VISCOSITY_ALPHA = 1.5;
+const float VISCOSITY_BETA = 3.0;
+const float ALPHA_MIN = 0.1;
+const float ALPHA_MAX = 2.0;
+const float CFL = 0.2;
+const float MIN_DT = 0.001;
+const float MAX_DT = 100.0;
+const float CELL_WIDTH = 0.15;
+const int CELL_POWER = 7;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 2) readonly buffer Densities { float densities[]; };
+layout(std430, binding = 3) readonly buffer InternalEnergy { float internalEnergy[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) readonly buffer SmoothingLengths { float smoothingLengths[]; };
+layout(std430, binding = 6) readonly buffer Pressures { float pressures[]; };
+layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
+layout(std430, binding = 10) buffer Accelerations { vec4 accelerations[]; };
+layout(std430, binding = 12) buffer DInternalEnergy { float dInternalEnergy[]; };
+layout(std430, binding = 13) buffer DhDt { float dhDt[]; };
+layout(std430, binding = 22) readonly buffer CellData { uvec2 cellData[]; };
+layout(std430, binding = 24) readonly buffer LargeCells { uint largeCells[]; };
+layout(std430, binding = 28) readonly buffer CellStart { uint cellStart[]; };
+layout(std430, binding = 29) readonly buffer CellEnd { uint cellEnd[]; };
+layout(std430, binding = 32) readonly buffer GradientTerms { float gradientTerms[]; };
+layout(std430, binding = 33) readonly buffer SpeedOfSound { float speedOfSound[]; };
+layout(std430, binding = 34) readonly buffer Balsara { float balsara[]; };
+layout(std430, binding = 35) buffer Alpha { float alpha[]; };
+layout(std430, binding = 36) buffer DaDt { float daDt[]; };
+layout(std430, binding = 37) buffer AlphaLoc { float alphaLoc[]; };
+layout(std430, binding = 38) readonly buffer PAlphaLoc { float pAlphaLoc[]; };
+layout(std430, binding = 39) buffer LocalMaxH { float localMaxH[]; };
+layout(std430, binding = 40) buffer NextActiveTime { int nextActiveTime[]; };
+layout(std430, binding = 43) buffer StepTicks { int stepTicks[]; };
+layout(std430, binding = 44) readonly buffer ActiveFlags { uint activeFlags[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+} pc;
+
+vec3 gradW(vec3 xij, float r, float h) {
+    if (r < 1e-12) return vec3(0.0);
+    float H1 = (1.0 / h) * GAMMA1;
+    float u = r * H1;
+    if (u > 1.0) return vec3(0.0);
+    float u2 = u * u;
+    float fac = KERNEL_CONSTANT * H1 * H1 * H1 * H1;
+    vec3 rhat = xij / r;
+    if (u > 0.5) return fac * (-3.0 * u2 + 6.0 * u - 3.0) * rhat;
+    return fac * (9.0 * u2 - 6.0 * u) * rhat;
+}
+
+float WFast(float r, float H1, float fac) {
+    float u = r * H1;
+    if (u > 1.0) return 0.0;
+    float u2 = u * u;
+    float u3 = u2 * u;
+    if (u > 0.5) return fac * (-u3 + 3.0 * u2 - 3.0 * u + 1.0);
+    return fac * (3.0 * u3 - 3.0 * u2 + 0.5);
+}
+
+uint splitBy3(uint a) {
+    uint x = a & 0x000003ffu;
+    x = (x | (x << 16)) & 0x030000FFu;
+    x = (x | (x << 8)) & 0x0300F00Fu;
+    x = (x | (x << 4)) & 0x030C30C3u;
+    x = (x | (x << 2)) & 0x09249249u;
+    return x;
+}
+
+uint morton3D(uint x, uint y, uint z) {
+    return splitBy3(x) | (splitBy3(y) << 1) | (splitBy3(z) << 2);
+}
+
+uint cellPositionToIndex(ivec3 pos) {
+    int mask = (1 << CELL_POWER) - 1;
+    ivec3 modded = ivec3(pos.x & mask, pos.y & mask, pos.z & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+uint cellPositionToLargeBoundIndex(ivec3 pos) {
+    int mask = (1 << 10) - 1;
+    ivec3 modded = ivec3((pos.x >> 4) & mask, (pos.y >> 4) & mask, (pos.z >> 4) & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles)) return;
+    uint ind = cellData[i].y;
+    if (alive[ind] == 0u) {
+        accelerations[ind] = vec4(0.0);
+        dInternalEnergy[ind] = 0.0;
+        dhDt[ind] = 0.0;
+        return;
+    }
+    if (activeFlags[ind] == 0u) {
+        atomicMin(stepTicks[0], max(nextActiveTime[ind] - pc.globalTime, 1));
+        return;
+    }
+
+    vec3 p = positions[ind].xyz;
+    vec3 v = velocities[ind].xyz;
+    float rhoI = densities[ind];
+    float hI = smoothingLengths[ind];
+    float factI = pressures[ind] * gradientTerms[ind] / (rhoI * rhoI);
+    float cI = speedOfSound[ind];
+    float alphaI = alpha[ind];
+    float BI = balsara[ind];
+    float H1 = (1.0 / hI) * GAMMA1;
+    float wFac = KERNEL_CONSTANT * H1 * H1 * H1;
+    float alphaLocal = (masses[ind] / rhoI) * pAlphaLoc[ind] * WFast(0.0, H1, wFac);
+    vec3 acc = vec3(0.0);
+    float du = 0.0;
+    float dh = 0.0;
+    float support = GAMMA * max(hI, localMaxH[ind]);
+    float support2 = support * support;
+    float hISupport2 = GAMMA * GAMMA * hI * hI;
+    float localMax = localMaxH[ind];
+    float vSigI = 2.0 * cI;
+    ivec3 cmin = ivec3(floor((p - vec3(support)) / CELL_WIDTH));
+    ivec3 cmax = ivec3(floor((p + vec3(support)) / CELL_WIDTH));
+    for (int x = cmin.x; x <= cmax.x; ++x) {
+        for (int y = cmin.y; y <= cmax.y; ++y) {
+            for (int z = cmin.z; z <= cmax.z; ++z) {
+                ivec3 cellPos = ivec3(x, y, z);
+                uint cell = cellPositionToIndex(cellPos);
+                uint start = cellStart[cell];
+                if (start == 0xFFFFFFFFu) continue;
+                vec3 cellMin = vec3(cellPos) * CELL_WIDTH;
+                vec3 cellMax = cellMin + vec3(CELL_WIDTH);
+                vec3 distToCell = clamp(p, cellMin, cellMax) - p;
+                if (dot(distToCell, distToCell) > support2) continue;
+                uint large = cellPositionToLargeBoundIndex(cellPos);
+                uint end = cellEnd[cell] + 1u;
+                for (uint k = start; k < end; ++k) {
+                    uint j = cellData[k].y;
+                    if (j == ind || alive[j] == 0u || largeCells[j] != large) continue;
+                    vec3 xij = p - positions[j].xyz;
+                    float r2 = dot(xij, xij);
+                    float hJ = smoothingLengths[j];
+                    float hJSupport = GAMMA * hJ;
+                    if ((r2 > hISupport2 && r2 > hJSupport * hJSupport) || r2 < 1e-12) continue;
+                    localMax = max(localMax, hJ);
+                    float r = sqrt(r2);
+                    float rhoJ = densities[j];
+                    vec3 vij = v - velocities[j].xyz;
+                    float mu = dot(vij, xij) < 0.0 ? dot(vij, xij) / r : 0.0;
+                    float cj = speedOfSound[j];
+                    float vsig = cI + cj - VISCOSITY_BETA * mu;
+                    vSigI = max(vSigI, vsig);
+                    float nu = -0.25 * (alphaI + alpha[j]) * (BI + balsara[j]) * mu * vsig / (rhoI + rhoJ);
+                    vec3 gWi = gradW(xij, r, hI);
+                    vec3 gWj = gradW(xij, r, hJ);
+                    vec3 visc = 0.5 * nu * (gWi + gWj);
+                    float factJ = pressures[j] * gradientTerms[j] / (rhoJ * rhoJ);
+                    vec3 sph = factI * gWi + factJ * gWj;
+                    acc -= masses[j] * (sph + visc);
+                    du += masses[j] * (factI * dot(vij, gWi) + 0.5 * dot(vij, visc));
+                    dh += (masses[j] / rhoJ) * dot(vij, gWi);
+                    alphaLocal += (masses[j] / rhoJ) * pAlphaLoc[j] * WFast(r, H1, wFac);
+                }
+            }
+        }
+    }
+    localMaxH[ind] = localMax;
+    float tau = hI / (0.1 * vSigI);
+    alphaLocal = clamp(alphaLocal, ALPHA_MIN, ALPHA_MAX);
+    if (alphaI < alphaLocal) alphaI = alphaLocal;
+    alpha[ind] = alphaI;
+    daDt[ind] = (alphaLocal - alphaI) / tau;
+    alphaLoc[ind] = alphaLocal;
+    accelerations[ind] = vec4(acc, 0.0);
+    dInternalEnergy[ind] = du;
+    dhDt[ind] = -0.333333333 * hI * dh;
+    float goalDt = clamp(2.0 * CFL * GAMMA * hI / vSigI, MIN_DT, MAX_DT);
+    int integerDt = 1;
+    while (2.0 * MIN_DT * float(integerDt) < goalDt && 2.0 * MIN_DT * float(integerDt) < MAX_DT) {
+        integerDt += integerDt;
+    }
+    nextActiveTime[ind] = pc.globalTime + integerDt;
+    atomicMin(stepTicks[0], integerDt);
+}

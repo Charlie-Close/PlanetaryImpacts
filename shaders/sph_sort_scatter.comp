@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const int SORTING_BLOCK_SIZE = 256;
+const int SORTING_MASK_LENGTH = 8;
+const int SORTING_BIT_MASK = 255;
+const int SORTING_BUCKET_NUMBER = 256;
+
+layout(std430, binding = 22) readonly buffer CellIn { uvec2 cellIn[]; };
+layout(std430, binding = 23) buffer CellOut { uvec2 cellOut[]; };
+layout(std430, binding = 25) readonly buffer BucketHist { uint bucketHist[]; };
+layout(std430, binding = 26) readonly buffer BucketOffset { uint bucketOffset[]; };
+layout(std430, binding = 27) readonly buffer ParticleOffset { uint particleOffset[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+} pc;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(pc.nParticles)) return;
+    uint shift = uint(pc.sortIteration * SORTING_MASK_LENGTH);
+    uint bucket = (cellIn[index].x >> shift) & SORTING_BIT_MASK;
+    uint block = index / SORTING_BLOCK_SIZE;
+    uint bOff = bucketOffset[bucket];
+    uint blockOffset = block == 0u ? 0u : bucketHist[(block - 1u) * SORTING_BUCKET_NUMBER + bucket];
+    uint subBlockOffset = particleOffset[index];
+    cellOut[bOff + subBlockOffset + blockOffset] = cellIn[index];
+}

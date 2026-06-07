@@ -1,0 +1,260 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const int N_EXPANSION_TERMS = 20;
+const float GAMMA = 1.825742;
+const float PLUMBER_EQUIVALENT = 3.0;
+const float GRAVITY_SMOOTHING_LENGTH = 0.12;
+const float MAX_FLOAT = 3.402823466e38;
+
+const int M = 0;
+const int X = 1;
+const int Y = 2;
+const int Z = 3;
+const int XX = 4;
+const int XY = 5;
+const int XZ = 6;
+const int YY = 7;
+const int YZ = 8;
+const int ZZ = 9;
+const int XXX = 10;
+const int XXY = 11;
+const int XXZ = 12;
+const int XYY = 13;
+const int XYZ = 14;
+const int XZZ = 15;
+const int YYY = 16;
+const int YYZ = 17;
+const int YZZ = 18;
+const int ZZZ = 19;
+
+struct Multipole {
+    vec4 pos;
+    vec4 minv;
+    vec4 maxv;
+    float size;
+    float expansion[N_EXPANSION_TERMS];
+    float power[4];
+    float minGrav;
+    float eta;
+    float pad0;
+    float pad1;
+};
+
+struct Local {
+    vec4 pos;
+    float expansion[N_EXPANSION_TERMS];
+};
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
+layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
+layout(std430, binding = 5) readonly buffer H { float smoothingLengths[]; };
+layout(std430, binding = 14) readonly buffer Tree { int tree[]; };
+layout(std430, binding = 15) buffer Multipoles { Multipole multipoles[]; };
+layout(std430, binding = 16) buffer Locals { Local locals[]; };
+layout(std430, binding = 17) buffer ParentIndexes { uint parentIndexes[]; };
+layout(std430, binding = 18) readonly buffer TreeLevel { int treeLevel[]; };
+layout(std430, binding = 21) readonly buffer GravAbs { float gravAbs[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+    int cellTableSize;
+    int pad0;
+    int pad1;
+    int pad2;
+} pc;
+
+void clearMultipole(int dataPointer) {
+    multipoles[dataPointer].pos = vec4(0.0);
+    multipoles[dataPointer].minv = vec4(MAX_FLOAT);
+    multipoles[dataPointer].maxv = vec4(-MAX_FLOAT);
+    multipoles[dataPointer].size = 0.0;
+    for (int i = 0; i < N_EXPANSION_TERMS; ++i) multipoles[dataPointer].expansion[i] = 0.0;
+    for (int i = 0; i < 4; ++i) multipoles[dataPointer].power[i] = 0.0;
+    multipoles[dataPointer].minGrav = MAX_FLOAT;
+    multipoles[dataPointer].eta = 0.0;
+    multipoles[dataPointer].pad0 = 0.0;
+    multipoles[dataPointer].pad1 = 0.0;
+}
+
+void addPowers(int dataPointer) {
+    Multipole mp = multipoles[dataPointer];
+    multipoles[dataPointer].power[0] = mp.expansion[M];
+    multipoles[dataPointer].power[1] = 0.0;
+    float p2 = mp.expansion[ZZ] * mp.expansion[ZZ];
+    p2 += 0.5 * mp.expansion[YZ] * mp.expansion[YZ];
+    p2 += mp.expansion[YY] * mp.expansion[YY];
+    p2 += 0.5 * mp.expansion[XZ] * mp.expansion[XZ];
+    p2 += 0.5 * mp.expansion[XY] * mp.expansion[XY];
+    p2 += 0.5 * mp.expansion[XX] * mp.expansion[XX];
+    multipoles[dataPointer].power[2] = sqrt(max(p2, 0.0));
+
+    float p3 = mp.expansion[ZZZ] * mp.expansion[ZZZ];
+    p3 += (1.0 / 3.0) * mp.expansion[YZZ] * mp.expansion[YZZ];
+    p3 += (1.0 / 3.0) * mp.expansion[YYZ] * mp.expansion[YYZ];
+    p3 = mp.expansion[YYY] * mp.expansion[YYY];
+    p3 += (1.0 / 3.0) * mp.expansion[XZZ] * mp.expansion[XZZ];
+    p3 += (1.0 / 6.0) * mp.expansion[XYZ] * mp.expansion[XYZ];
+    p3 += (1.0 / 3.0) * mp.expansion[XYY] * mp.expansion[XYY];
+    p3 += (1.0 / 3.0) * mp.expansion[XXZ] * mp.expansion[XXZ];
+    p3 += (1.0 / 3.0) * mp.expansion[XXY] * mp.expansion[XXY];
+    p3 = mp.expansion[XXX] * mp.expansion[XXX];
+    multipoles[dataPointer].power[3] = sqrt(max(p3, 0.0));
+}
+
+void accumulateP2M(int treePointer, int dataPointer, float fdt) {
+    int nParticles = tree[treePointer];
+    int start = treePointer + 2;
+    int end = start + nParticles;
+
+    for (int i = start; i < end; ++i) {
+        int p = tree[i];
+        if (p < 0 || p >= pc.nParticles) continue;
+        float pmass = masses[p];
+        vec3 ppos = positions[p].xyz + 0.5 * fdt * velocities[p].xyz;
+        float peta = min(smoothingLengths[p] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
+        multipoles[dataPointer].maxv.xyz = max(multipoles[dataPointer].maxv.xyz, ppos);
+        multipoles[dataPointer].minv.xyz = min(multipoles[dataPointer].minv.xyz, ppos);
+        multipoles[dataPointer].eta = max(multipoles[dataPointer].eta, peta);
+        multipoles[dataPointer].expansion[M] += pmass;
+        multipoles[dataPointer].pos.xyz += ppos * pmass;
+        multipoles[dataPointer].minGrav = min(multipoles[dataPointer].minGrav, gravAbs[p]);
+    }
+
+    float mass = multipoles[dataPointer].expansion[M];
+    multipoles[dataPointer].pos.xyz /= max(mass, 1e-30);
+
+    for (int i = start; i < end; ++i) {
+        int p = tree[i];
+        if (p < 0 || p >= pc.nParticles) continue;
+        float pmass = masses[p];
+        vec3 ppos = positions[p].xyz + 0.5 * fdt * velocities[p].xyz;
+        vec3 r = ppos - multipoles[dataPointer].pos.xyz;
+
+        multipoles[dataPointer].expansion[X] -= r.x * pmass;
+        multipoles[dataPointer].expansion[Y] -= r.y * pmass;
+        multipoles[dataPointer].expansion[Z] -= r.z * pmass;
+
+        multipoles[dataPointer].expansion[XX] += pmass * r.x * r.x;
+        multipoles[dataPointer].expansion[XY] += pmass * r.x * r.y;
+        multipoles[dataPointer].expansion[XZ] += pmass * r.x * r.z;
+        multipoles[dataPointer].expansion[YY] += pmass * r.y * r.y;
+        multipoles[dataPointer].expansion[YZ] += pmass * r.y * r.z;
+        multipoles[dataPointer].expansion[ZZ] += pmass * r.z * r.z;
+
+        multipoles[dataPointer].expansion[XXX] -= pmass * r.x * r.x * r.x;
+        multipoles[dataPointer].expansion[XXY] -= pmass * r.x * r.x * r.y;
+        multipoles[dataPointer].expansion[XXZ] -= pmass * r.x * r.x * r.z;
+        multipoles[dataPointer].expansion[XYY] -= pmass * r.x * r.y * r.y;
+        multipoles[dataPointer].expansion[XYZ] -= pmass * r.x * r.y * r.z;
+        multipoles[dataPointer].expansion[XZZ] -= pmass * r.x * r.z * r.z;
+        multipoles[dataPointer].expansion[YYY] -= pmass * r.y * r.y * r.y;
+        multipoles[dataPointer].expansion[YYZ] -= pmass * r.y * r.y * r.z;
+        multipoles[dataPointer].expansion[YZZ] -= pmass * r.y * r.z * r.z;
+        multipoles[dataPointer].expansion[ZZZ] -= pmass * r.z * r.z * r.z;
+    }
+
+    multipoles[dataPointer].expansion[XX] *= 0.5;
+    multipoles[dataPointer].expansion[YY] *= 0.5;
+    multipoles[dataPointer].expansion[ZZ] *= 0.5;
+    multipoles[dataPointer].expansion[XXX] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[YYY] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[ZZZ] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[XXY] *= 0.5;
+    multipoles[dataPointer].expansion[XXZ] *= 0.5;
+    multipoles[dataPointer].expansion[XYY] *= 0.5;
+    multipoles[dataPointer].expansion[XZZ] *= 0.5;
+    multipoles[dataPointer].expansion[YYZ] *= 0.5;
+    multipoles[dataPointer].expansion[YZZ] *= 0.5;
+}
+
+float transformedExpansion(Multipole mp, vec3 r, int term) {
+    if (term == M) return mp.expansion[M];
+    if (term == X || term == Y || term == Z) return 0.0;
+    if (term == XX) return mp.expansion[XX] + 0.5 * r.x * r.x * mp.expansion[M];
+    if (term == XY) return mp.expansion[XY] + r.x * r.y * mp.expansion[M];
+    if (term == XZ) return mp.expansion[XZ] + r.x * r.z * mp.expansion[M];
+    if (term == YY) return mp.expansion[YY] + 0.5 * r.y * r.y * mp.expansion[M];
+    if (term == YZ) return mp.expansion[YZ] + r.y * r.z * mp.expansion[M];
+    if (term == ZZ) return mp.expansion[ZZ] + 0.5 * r.z * r.z * mp.expansion[Z];
+    if (term == ZZZ) return mp.expansion[ZZZ] + r.z * mp.expansion[ZZ] + 0.166666666667 * r.z * r.z * r.z * mp.expansion[M];
+    if (term == YZZ) return mp.expansion[YZZ] + r.z * mp.expansion[YZ] + r.y * mp.expansion[ZZ] + 0.5 * r.y * r.z * r.z * mp.expansion[M];
+    if (term == YYZ) return mp.expansion[YYZ] + r.z * mp.expansion[YY] + r.y * mp.expansion[YZ] + 0.5 * r.y * r.y * r.z * mp.expansion[M];
+    if (term == YYY) return mp.expansion[YYY] + r.y * mp.expansion[YY] + 0.166666666667 * r.y * r.y * r.y * mp.expansion[M];
+    if (term == XZZ) return mp.expansion[XZZ] + r.z * mp.expansion[XZ] + r.x * mp.expansion[ZZ] + 0.5 * r.x * r.z * r.z * mp.expansion[M];
+    if (term == XYZ) return mp.expansion[XYZ] + r.z * mp.expansion[XY] + r.y * mp.expansion[XZ] + r.x * mp.expansion[YZ] + r.x * r.y * r.z * mp.expansion[M];
+    if (term == XYY) return mp.expansion[XYY] + r.y * mp.expansion[XY] + r.x * mp.expansion[YY] + 0.5 * r.x * r.y * r.y * mp.expansion[M];
+    if (term == XXZ) return mp.expansion[XXZ] + r.z * mp.expansion[XX] + r.x * mp.expansion[XZ] + 0.5 * r.x * r.x * r.z * mp.expansion[M];
+    if (term == XXY) return mp.expansion[XXY] + r.y * mp.expansion[XX] + r.x * mp.expansion[XY] + 0.5 * r.x * r.x * r.y * mp.expansion[M];
+    if (term == XXX) return mp.expansion[XXX] + r.x * mp.expansion[XX] + 0.1666666667 * r.x * r.x * r.x * mp.expansion[M];
+    return 0.0;
+}
+
+void accumulateM2M(int treePointer, int dataPointer, uint levelIndex) {
+    float mass = 0.0;
+    for (int c = 0; c < 8; ++c) {
+        int childPointer = tree[treePointer + 2 + c];
+        if (childPointer == -1) continue;
+        int childData = tree[childPointer + 1];
+        parentIndexes[childData] = levelIndex;
+        Multipole child = multipoles[childData];
+        multipoles[dataPointer].minGrav = min(child.minGrav, multipoles[dataPointer].minGrav);
+        mass += child.expansion[M];
+        multipoles[dataPointer].pos.xyz += child.pos.xyz * child.expansion[M];
+        multipoles[dataPointer].eta = max(multipoles[dataPointer].eta, child.eta);
+        multipoles[dataPointer].maxv.xyz = max(multipoles[dataPointer].maxv.xyz, child.maxv.xyz);
+        multipoles[dataPointer].minv.xyz = min(multipoles[dataPointer].minv.xyz, child.minv.xyz);
+    }
+
+    multipoles[dataPointer].pos.xyz /= max(mass, 1e-30);
+
+    for (int c = 0; c < 8; ++c) {
+        int childPointer = tree[treePointer + 2 + c];
+        if (childPointer == -1) continue;
+        int childData = tree[childPointer + 1];
+        Multipole child = multipoles[childData];
+        vec3 r = multipoles[dataPointer].pos.xyz - child.pos.xyz;
+        for (int j = 0; j < N_EXPANSION_TERMS; ++j) {
+            multipoles[dataPointer].expansion[j] += transformedExpansion(child, r, j);
+        }
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.workItems)) return;
+
+    int treePointer = treeLevel[pc.parentStride + int(i)];
+    if (treePointer < 0) return;
+    int nParticles = tree[treePointer];
+    int dataPointer = tree[treePointer + 1];
+    if (dataPointer < 0) return;
+    clearMultipole(dataPointer);
+
+    float fdt = pc.minDt * float(pc.stepTicks);
+    if (nParticles == 0) {
+        accumulateM2M(treePointer, dataPointer, i);
+    } else if (nParticles > 0 && nParticles <= 8) {
+        accumulateP2M(treePointer, dataPointer, fdt);
+    } else {
+        return;
+    }
+
+    vec3 radius = max(abs(multipoles[dataPointer].maxv.xyz - multipoles[dataPointer].pos.xyz),
+                      abs(multipoles[dataPointer].minv.xyz - multipoles[dataPointer].pos.xyz));
+    multipoles[dataPointer].size = length(radius);
+    addPowers(dataPointer);
+}

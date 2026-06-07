@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+const float CELL_WIDTH = 0.15;
+const int CELL_POWER = 7;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
+layout(std430, binding = 22) buffer Cells { uvec2 cells[]; };
+layout(std430, binding = 24) buffer LargeCells { uint largeCells[]; };
+
+layout(push_constant) uniform PushConstants {
+    int nParticles;
+    int stepTicks;
+    int globalTime;
+    float minDt;
+    float gravityG;
+    float boxCenter;
+    float boxSize;
+    float gravitySoftening;
+    int workItems;
+    int parentStride;
+    int stride;
+    int sortIteration;
+} pc;
+
+uint splitBy3(uint a) {
+    uint x = a & 0x000003ffu;
+    x = (x | (x << 16)) & 0x030000FFu;
+    x = (x | (x << 8)) & 0x0300F00Fu;
+    x = (x | (x << 4)) & 0x030C30C3u;
+    x = (x | (x << 2)) & 0x09249249u;
+    return x;
+}
+
+uint morton3D(uint x, uint y, uint z) {
+    return splitBy3(x) | (splitBy3(y) << 1) | (splitBy3(z) << 2);
+}
+
+uint cellPositionToIndex(ivec3 pos) {
+    int mask = (1 << CELL_POWER) - 1;
+    ivec3 modded = ivec3(pos.x & mask, pos.y & mask, pos.z & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+uint cellPositionToLargeBoundIndex(ivec3 pos) {
+    int mask = (1 << 10) - 1;
+    ivec3 modded = ivec3((pos.x >> 4) & mask, (pos.y >> 4) & mask, (pos.z >> 4) & mask);
+    return morton3D(uint(modded.x), uint(modded.y), uint(modded.z));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.nParticles)) return;
+    ivec3 intPos = ivec3(floor(positions[i].xyz / CELL_WIDTH));
+    cells[i] = uvec2(cellPositionToIndex(intPos), i);
+    largeCells[i] = cellPositionToLargeBoundIndex(intPos);
+}
