@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -151,13 +152,16 @@ int main(int argc, char** argv) {
         if (options.headless) {
             sph::VulkanSimulation gpuSimulation(simulator);
             std::cout << "Simulation Vulkan device: " << gpuSimulation.deviceName() << "\n";
+            const bool quietSteps = std::getenv("SPH_QUIET_STEPS") != nullptr;
             int nextSnapshot = 0;
             for (int i = 0; i < options.steps; ++i) {
                 const auto start = std::chrono::steady_clock::now();
                 gpuSimulation.step();
                 const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
-                std::cout << "GPU step " << (i + 1) << "/" << options.steps
-                          << " time=" << simulator.time() << "s wall=" << elapsed.count() << "s\n";
+                if (!quietSteps) {
+                    std::cout << "GPU step " << (i + 1) << "/" << options.steps
+                              << " time=" << simulator.time() << "s wall=" << elapsed.count() << "s\n";
+                }
                 if (options.snapshots && simulator.time() > static_cast<float>(nextSnapshot)) {
                     const int initialSnapshot = static_cast<int>(std::round(sph::params::startSnapshot * (1000.0f / sph::params::snapshotPeriodSeconds)));
                     const int currentFrame = static_cast<int>(std::round(static_cast<float>(nextSnapshot) / sph::params::snapshotPeriodSeconds));

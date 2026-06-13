@@ -2,11 +2,7 @@
 
 layout(local_size_x = 256) in;
 
-const int N_EXPANSION_TERMS = 20;
-const float GAMMA = 1.825742;
-const float PLUMBER_EQUIVALENT = 3.0;
-const float GRAVITY_SMOOTHING_LENGTH = 0.12;
-const float MAX_FLOAT = 3.402823466e38;
+#include "sph_params.glsl"
 
 const int M = 0;
 const int X = 1;

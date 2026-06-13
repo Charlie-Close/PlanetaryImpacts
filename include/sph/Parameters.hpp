@@ -31,7 +31,7 @@ inline constexpr float gdt = 0.5f;
 inline constexpr float minDt = 0.001f;
 inline constexpr float maxDt = 100.0f;
 inline constexpr int densityGradientSettlingIterations = 3;
-inline constexpr int activateAllSteps = 8192;
+inline constexpr int activateAllSteps = 1024;
 
 inline constexpr float gamma = 1.825742f;
 inline constexpr float gamma1 = 1.0f / gamma;
@@ -40,10 +40,19 @@ inline constexpr float kernelConstant = 16.0f / 3.14159265358979323846f;
 inline constexpr float gravityG = 6.67e-5f;
 inline constexpr float gravitySmoothingLength = 0.12f;
 inline constexpr float plumberEquivalent = 3.0f;
+inline constexpr float gravityEta = 0.001f;
+inline constexpr int expansionTerms = 20;
+inline constexpr int maxUncheckedPointers = 32;
+inline constexpr int maxLocalUncheckedPointers = 256;
+inline constexpr int gravityMaxRecursion = 8;
+inline constexpr float maxFloat = 3.402823466e38f;
 
 inline constexpr float cellWidth = 0.15f;
 inline constexpr int cellPower = 8;
 inline constexpr int sortingBlockSize = 256;
+inline constexpr int sortingMaskLength = 8;
+inline constexpr int sortingBucketNumber = 1 << sortingMaskLength;
+inline constexpr int sortingBitMask = sortingBucketNumber - 1;
 inline constexpr int shuffleFrames = 64;
 
 inline constexpr float particleSize = 160.0f;

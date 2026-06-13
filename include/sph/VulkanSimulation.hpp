@@ -8,6 +8,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 #include "Octree.hpp"
+#include "Parameters.hpp"
 #include "Simulator.hpp"
 
 namespace sph {
@@ -48,8 +49,8 @@ public:
     const Buffer& alphaBuffer() const { return alpha_; }
 
 private:
-    static constexpr int ExpansionTerms = 20;
-    static constexpr int MaxUncheckedPointers = 32;
+    static constexpr int ExpansionTerms = params::expansionTerms;
+    static constexpr int MaxUncheckedPointers = params::maxUncheckedPointers;
 
     struct alignas(16) GpuMultipole {
         Vec4 pos{};
@@ -120,6 +121,7 @@ private:
     void createCommandResources();
     void createBuffers();
     void createPipeline();
+    void updateDescriptorSet();
     void uploadInitialState();
     void rebuildOctreeBuffers();
     void applyOctreeData(const OctreeData& octree);
@@ -134,6 +136,7 @@ private:
     Simulator& simulator_;
     uint32_t particleCount_ = 0;
     int32_t globalTimeTicks_ = 0;
+    uint64_t diagnosticStepIndex_ = 0;
     std::string deviceName_;
 
     VkInstance instance_ = VK_NULL_HANDLE;

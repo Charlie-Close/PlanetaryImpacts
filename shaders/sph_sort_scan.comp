@@ -2,8 +2,7 @@
 
 layout(local_size_x = 1) in;
 
-const int SORTING_BUCKET_NUMBER = 256;
-const int SORTING_BIT_MASK = 255;
+#include "sph_params.glsl"
 
 layout(std430, binding = 25) buffer BucketHist { uint bucketHist[]; };
 layout(std430, binding = 26) buffer BucketOffset { uint bucketOffset[]; };

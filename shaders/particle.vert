@@ -1,5 +1,7 @@
 #version 450
 
+#include "sph_params.glsl"
+
 layout(location = 0) in vec2 inQuad;
 
 layout(binding = 0) uniform Camera {
@@ -73,7 +75,7 @@ void main() {
     }
     vec3 worldPosition = worldOffset + inPosition;
     gl_Position = camera.viewProj * vec4(worldPosition, 1.0);
-    vec3 lightDir = normalize(vec3(-1.0, -1.0, 0.5));
+    vec3 lightDir = normalize(SPH_LIGHT_DIRECTION);
     lightspacePos = camera.lightViewProj * vec4(worldPosition - 8.0 * lightDir * size, 1.0);
     colour = inMaterial == 201 ? vec3(0.05, 0.05, 0.7) : vec3(0.3, 0.3, 0.35);
     float emission = pow(clamp(inTemperature / 8000.0, 0.0, 1.0), 4.0);

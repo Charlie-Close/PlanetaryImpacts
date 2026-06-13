@@ -1,5 +1,7 @@
 #version 450
 
+#include "sph_params.glsl"
+
 layout(location = 0) in vec2 vertPos;
 layout(location = 1) in vec3 rightVec;
 layout(location = 2) in vec3 upVec;
@@ -30,7 +32,7 @@ void main() {
     if (r2 > 1.0) {
         discard;
     }
-    vec3 lightDir = normalize(vec3(-1.0, -1.0, 0.5));
+    vec3 lightDir = normalize(SPH_LIGHT_DIRECTION);
     float z = sqrt(1.0 - r2);
     vec3 normal = vertPos.x * rightVec + vertPos.y * upVec - z * viewNorm;
     if (gradWeight != 0.0) normal = mix(normal, rhoGradNorm, gradWeight);

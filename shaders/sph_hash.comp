@@ -2,8 +2,7 @@
 
 layout(local_size_x = 256) in;
 
-const float CELL_WIDTH = 0.15;
-const int CELL_POWER = 7;
+#include "sph_params.glsl"
 
 layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
 layout(std430, binding = 22) buffer Cells { uvec2 cells[]; };

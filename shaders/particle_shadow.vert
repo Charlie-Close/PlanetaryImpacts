@@ -1,5 +1,7 @@
 #version 450
 
+#include "sph_params.glsl"
+
 layout(location = 0) in vec2 inQuad;
 
 layout(binding = 0) uniform Camera {
@@ -19,7 +21,7 @@ layout(location = 0) out vec2 vertPos;
 void main() {
     vertPos = inQuad;
     uint instanceId = instanceIds[gl_InstanceIndex];
-    vec3 lightDir = vec3(-1.0, -1.0, 0.5);
+    vec3 lightDir = SPH_LIGHT_DIRECTION;
     vec3 right = normalize(cross(lightDir, vec3(0.0, 1.0, 0.0)));
     vec3 up = normalize(cross(lightDir, right));
     float rho = densities[instanceId];

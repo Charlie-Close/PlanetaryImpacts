@@ -2,10 +2,7 @@
 
 layout(local_size_x = 1) in;
 
-const int SORTING_BLOCK_SIZE = 256;
-const int SORTING_MASK_LENGTH = 8;
-const int SORTING_BUCKET_NUMBER = 256;
-const int SORTING_BIT_MASK = 255;
+#include "sph_params.glsl"
 
 layout(std430, binding = 22) readonly buffer CellIn { uvec2 cellIn[]; };
 layout(std430, binding = 25) buffer BucketHist { uint bucketHist[]; };

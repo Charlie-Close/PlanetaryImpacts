@@ -2,18 +2,7 @@
 
 layout(local_size_x = 256) in;
 
-const float GAMMA = 1.825742;
-const float GAMMA1 = 1.0 / GAMMA;
-const float KERNEL_CONSTANT = 16.0 / 3.14159265358979323846;
-const float VISCOSITY_ALPHA = 1.5;
-const float VISCOSITY_BETA = 3.0;
-const float ALPHA_MIN = 0.1;
-const float ALPHA_MAX = 2.0;
-const float CFL = 0.2;
-const float MIN_DT = 0.001;
-const float MAX_DT = 100.0;
-const float CELL_WIDTH = 0.15;
-const int CELL_POWER = 7;
+#include "sph_params.glsl"
 
 layout(std430, binding = 0) readonly buffer Positions { vec4 positions[]; };
 layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };

@@ -2,14 +2,7 @@
 
 layout(local_size_x = 256) in;
 
-const int N_EXPANSION_TERMS = 20;
-const int MAX_LOCAL_UNCHECKED_POINTERS = 256;
-const int GRAVITY_MAX_RECURSION = 8;
-const float GAMMA = 1.825742;
-const float PLUMBER_EQUIVALENT = 3.0;
-const float GRAVITY_ETA = 0.001;
-const float GDT = 0.5;
-const float MAX_DT = 100.0;
+#include "sph_params.glsl"
 
 const int M = 0;
 const int X = 1;
@@ -437,13 +430,13 @@ void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, flo
     int end = start + nParticles;
     for (int i = start; i < end; ++i) {
         int particle = tree[i];
-        if (particle < 0 || particle >= pc.nParticles || alive[particle] == 0u) continue;
+        if (particle < 0 || particle >= pc.nParticles) continue;
         vec3 xi = positions[particle].xyz + 0.5 * curDt * velocities[particle].xyz;
         vec3 acc = l2p(local, xi);
         for (int j = start; j < end; ++j) {
             if (i == j) continue;
             int pj = tree[j];
-            if (pj < 0 || pj >= pc.nParticles || alive[pj] == 0u) continue;
+            if (pj < 0 || pj >= pc.nParticles) continue;
             vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
             vec3 xij = xi - xj;
             float r = length(xij);
@@ -464,7 +457,7 @@ void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, flo
             if (np <= 0 || np > 8) continue;
             for (int j = nodePointer + 2; j < nodePointer + 2 + np; ++j) {
                 int pj = tree[j];
-                if (pj < 0 || pj >= pc.nParticles || alive[pj] == 0u) continue;
+                if (pj < 0 || pj >= pc.nParticles) continue;
                 vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
                 vec3 xij = xi - xj;
                 float r = length(xij);

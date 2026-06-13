@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include "lodepng.h"
@@ -134,7 +136,10 @@ VulkanSimulation::VulkanSimulation(Simulator& simulator,
 }
 
 VulkanSimulation::~VulkanSimulation() {
-    if (device_) vkDeviceWaitIdle(device_);
+    // All simulation submissions are synchronized with fence_ before step() returns.
+    // MoltenVK can wedge indefinitely in a redundant process-exit vkDeviceWaitIdle()
+    // after long compute runs, so keep the global idle wait opt-in for diagnostics.
+    if (device_ && std::getenv("SPH_WAIT_IDLE_ON_DESTROY") != nullptr) vkDeviceWaitIdle(device_);
     destroyBuffer(alive_);
     destroyBuffer(temperatures_);
     destroyBuffer(materialIds_);
@@ -380,8 +385,8 @@ void VulkanSimulation::createBuffers() {
     cellArrayB_ = createBuffer(n * sizeof(uint32_t) * 2, storage, hostCoherent);
     largeParticleCells_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
     const uint32_t nBlocks = (particleCount_ / params::sortingBlockSize) + 1;
-    bucketHist_ = createBuffer(static_cast<VkDeviceSize>(nBlocks) * 256 * sizeof(uint32_t), storage, hostCoherent);
-    bucketOffset_ = createBuffer(256 * sizeof(uint32_t), storage, hostCoherent);
+    bucketHist_ = createBuffer(static_cast<VkDeviceSize>(nBlocks) * params::sortingBucketNumber * sizeof(uint32_t), storage, hostCoherent);
+    bucketOffset_ = createBuffer(params::sortingBucketNumber * sizeof(uint32_t), storage, hostCoherent);
     particleOffset_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
     cellTableSize_ = 1u << (3 * params::cellPower);
     const VkDeviceSize cellCount = cellTableSize_;
@@ -560,6 +565,7 @@ void VulkanSimulation::applyOctreeData(const OctreeData& octree) {
         localGravB_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, hostCoherent);
     }
     if (!octree.tree.empty()) std::memcpy(tree_.mapped, octree.tree.data(), octree.tree.size() * sizeof(int32_t));
+    if (descriptorSet_ != VK_NULL_HANDLE) updateDescriptorSet();
 }
 
 void VulkanSimulation::applyPendingOctreeBuild(bool profileStep) {
@@ -606,6 +612,43 @@ VkShaderModule VulkanSimulation::shaderModule(const std::string& path) const {
     VkShaderModule module = VK_NULL_HANDLE;
     check(vkCreateShaderModule(device_, &info, nullptr, &module), "vkCreateShaderModule");
     return module;
+}
+
+void VulkanSimulation::updateDescriptorSet() {
+    if (descriptorSet_ == VK_NULL_HANDLE) return;
+    std::array<Buffer*, 76> buffers = {&positions_, &velocities_, &densities_, &internalEnergy_, &masses_,
+                                       &smoothingLengths_, &pressures_, &materialIds_, &temperatures_, &alive_,
+                                       &accelerations_, &gravAccelerations_, &dInternalEnergy_, &dhDt_,
+                                       &tree_, &multipoles_, &locals_, &parentIndexes_, &treeLevel_,
+                                       &localGravA_, &localGravB_, &gravAbs_,
+                                       &cellArrayA_, &cellArrayB_, &largeParticleCells_, &bucketHist_,
+                                       &bucketOffset_, &particleOffset_, &cellStart_, &cellEnd_,
+                                       &accelerations1_, &dInternalEnergy1_, &gradientTerms_, &speedOfSound_,
+                                       &balsara_, &alpha_, &daDt_, &alphaLoc_, &pAlphaLoc_, &localMaxH_,
+                                       &nextActiveTime_, &eosTables_, &eosMeta_, &stepTicks_, &active_,
+                                       &gravityStepTicks_, &rhoGrads_,
+                                       &scratchPositions_, &scratchVelocities_, &scratchDensities_, &scratchInternalEnergy_,
+                                       &scratchMasses_, &scratchSmoothingLengths_, &scratchPressures_, &scratchMaterialIds_,
+                                       &scratchTemperatures_, &scratchAlive_, &scratchAccelerations_, &scratchGravAccelerations_,
+                                       &scratchDInternalEnergy_, &scratchDhDt_, &scratchGravAbs_, &scratchAccelerations1_,
+                                       &scratchDInternalEnergy1_, &scratchGradientTerms_, &scratchRhoGrads_, &scratchSpeedOfSound_,
+                                       &scratchBalsara_, &scratchAlpha_, &scratchDaDt_, &scratchAlphaLoc_,
+                                       &scratchPAlphaLoc_, &scratchLocalMaxH_, &scratchNextActiveTime_,
+                                       &particleIds_, &scratchParticleIds_};
+    std::array<VkDescriptorBufferInfo, 76> infos{};
+    std::array<VkWriteDescriptorSet, 76> writes{};
+    for (uint32_t i = 0; i < buffers.size(); ++i) {
+        infos[i].buffer = buffers[i]->buffer;
+        infos[i].offset = 0;
+        infos[i].range = buffers[i]->size;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void VulkanSimulation::createPipeline() {
@@ -684,50 +727,34 @@ void VulkanSimulation::createPipeline() {
     check(vkAllocateDescriptorSets(device_, &alloc, &descriptorSet_), "vkAllocateDescriptorSets");
 
     std::cout << "Writing simulation descriptors..." << std::endl;
-    std::array<Buffer*, 76> buffers = {&positions_, &velocities_, &densities_, &internalEnergy_, &masses_,
-                                       &smoothingLengths_, &pressures_, &materialIds_, &temperatures_, &alive_,
-                                       &accelerations_, &gravAccelerations_, &dInternalEnergy_, &dhDt_,
-                                       &tree_, &multipoles_, &locals_, &parentIndexes_, &treeLevel_,
-                                       &localGravA_, &localGravB_, &gravAbs_,
-                                       &cellArrayA_, &cellArrayB_, &largeParticleCells_, &bucketHist_,
-                                       &bucketOffset_, &particleOffset_, &cellStart_, &cellEnd_,
-                                       &accelerations1_, &dInternalEnergy1_, &gradientTerms_, &speedOfSound_,
-                                       &balsara_, &alpha_, &daDt_, &alphaLoc_, &pAlphaLoc_, &localMaxH_,
-                                       &nextActiveTime_, &eosTables_, &eosMeta_, &stepTicks_, &active_,
-                                       &gravityStepTicks_, &rhoGrads_,
-                                       &scratchPositions_, &scratchVelocities_, &scratchDensities_, &scratchInternalEnergy_,
-                                       &scratchMasses_, &scratchSmoothingLengths_, &scratchPressures_, &scratchMaterialIds_,
-                                       &scratchTemperatures_, &scratchAlive_, &scratchAccelerations_, &scratchGravAccelerations_,
-                                       &scratchDInternalEnergy_, &scratchDhDt_, &scratchGravAbs_, &scratchAccelerations1_,
-                                       &scratchDInternalEnergy1_, &scratchGradientTerms_, &scratchRhoGrads_, &scratchSpeedOfSound_,
-                                       &scratchBalsara_, &scratchAlpha_, &scratchDaDt_, &scratchAlphaLoc_,
-                                       &scratchPAlphaLoc_, &scratchLocalMaxH_, &scratchNextActiveTime_,
-                                       &particleIds_, &scratchParticleIds_};
-    std::array<VkDescriptorBufferInfo, 76> infos{};
-    std::array<VkWriteDescriptorSet, 76> writes{};
-    for (uint32_t i = 0; i < buffers.size(); ++i) {
-        infos[i].buffer = buffers[i]->buffer;
-        infos[i].offset = 0;
-        infos[i].range = buffers[i]->size;
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = descriptorSet_;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &infos[i];
-    }
-    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    updateDescriptorSet();
     std::cout << "Simulation pipeline setup complete." << std::endl;
 }
 
 void VulkanSimulation::step(int maxTicks) {
     maxTicks = std::max(maxTicks, 0);
+    const uint64_t diagnosticStepIndex = ++diagnosticStepIndex_;
     const bool profileStep = std::getenv("SPH_PROFILE_STEPS") != nullptr;
     const bool debugStats = std::getenv("SPH_DEBUG_STATS") != nullptr;
-    const bool traceSegments = std::getenv("SPH_TRACE_SEGMENTS") != nullptr;
+    const uint64_t traceStart = std::getenv("SPH_TRACE_STEP_START") != nullptr
+        ? static_cast<uint64_t>(std::strtoull(std::getenv("SPH_TRACE_STEP_START"), nullptr, 10))
+        : 0u;
+    const uint64_t traceEnd = std::getenv("SPH_TRACE_STEP_END") != nullptr
+        ? static_cast<uint64_t>(std::strtoull(std::getenv("SPH_TRACE_STEP_END"), nullptr, 10))
+        : std::numeric_limits<uint64_t>::max();
+    const bool traceSegments = std::getenv("SPH_TRACE_SEGMENTS") != nullptr &&
+        diagnosticStepIndex >= traceStart && diagnosticStepIndex <= traceEnd;
+    const bool traceGravityBuffers = std::getenv("SPH_TRACE_GRAVITY_BUFFERS") != nullptr &&
+        diagnosticStepIndex >= traceStart && diagnosticStepIndex <= traceEnd;
+    const bool traceGravityStats = std::getenv("SPH_TRACE_GRAVITY_STATS") != nullptr &&
+        diagnosticStepIndex >= traceStart && diagnosticStepIndex <= traceEnd;
     const char* slowSegmentEnv = std::getenv("SPH_SLOW_SEGMENT_MS");
     const double slowSegmentMs = slowSegmentEnv != nullptr ? std::atof(slowSegmentEnv) : 0.0;
-    uint32_t gravityDownChunkSize = 8192;
+    const char* gpuWaitTimeoutEnv = std::getenv("SPH_GPU_WAIT_TIMEOUT_MS");
+    const uint64_t gpuWaitTimeoutMs = gpuWaitTimeoutEnv != nullptr
+        ? static_cast<uint64_t>(std::strtoull(gpuWaitTimeoutEnv, nullptr, 10))
+        : 0u;
+    uint32_t gravityDownChunkSize = 8192 * 4;
     if (const char* chunkEnv = std::getenv("SPH_GRAVITY_CHUNK_SIZE")) {
         gravityDownChunkSize = std::max<uint32_t>(64u, static_cast<uint32_t>(std::atoi(chunkEnv)));
     }
@@ -770,19 +797,42 @@ void VulkanSimulation::step(int maxTicks) {
         recordedCommands = true;
         barrier();
     };
+    auto waitForSimulationFence = [&](const std::string& label) {
+        if (gpuWaitTimeoutMs == 0u) {
+            check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), label.c_str());
+            return;
+        }
+        const uint64_t timeoutNs = gpuWaitTimeoutMs * 1000000ull;
+        const VkResult result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, timeoutNs);
+        if (result == VK_SUCCESS) return;
+        if (result == VK_TIMEOUT) {
+            throw std::runtime_error(label + " timed out after " + std::to_string(gpuWaitTimeoutMs) +
+                                     " ms at simulation step " + std::to_string(diagnosticStepIndex) +
+                                     " time_ticks=" + std::to_string(globalTimeTicks_));
+        }
+        check(result, label.c_str());
+    };
     auto submitProfileSegment = [&](const char* label) {
         check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer profile segment");
         const auto submitStart = std::chrono::steady_clock::now();
         if (recordedCommands) {
-            if (traceSegments) std::cout << "[trace] submit " << label << std::endl;
+            if (traceSegments) {
+                std::cout << "[trace] step=" << diagnosticStepIndex
+                          << " ticks=" << globalTimeTicks_
+                          << " submit " << label << std::endl;
+            }
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &commandBuffer_;
             const std::string submitLabel = std::string("vkQueueSubmit ") + label;
             const std::string waitLabel = std::string("vkWaitForFences ") + label;
             check(vkQueueSubmit(queue_, 1, &submit, fence_), submitLabel.c_str());
-            check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), waitLabel.c_str());
-            if (traceSegments) std::cout << "[trace] done " << label << std::endl;
+            waitForSimulationFence(waitLabel);
+            if (traceSegments) {
+                std::cout << "[trace] step=" << diagnosticStepIndex
+                          << " ticks=" << globalTimeTicks_
+                          << " done " << label << std::endl;
+            }
         }
         const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - submitStart;
         if (profileStep || (slowSegmentMs > 0.0 && elapsed.count() >= slowSegmentMs)) {
@@ -802,7 +852,7 @@ void VulkanSimulation::step(int maxTicks) {
         pc.sortIteration = iteration;
         if (kTraceSimulationPasses) std::cout << "  sort iteration " << iteration << std::endl;
         dispatch(pipelines_[SortHistPipeline], nBlocks, 1);
-        dispatch(pipelines_[SortScanPipeline], 256, 1, nBlocks);
+        dispatch(pipelines_[SortScanPipeline], params::sortingBucketNumber, 1, nBlocks);
         dispatch(pipelines_[SortSumPipeline], 1, 1);
         dispatch(pipelines_[SortScatterPipeline], particleCount_);
         VkBufferCopy copy{};
@@ -854,6 +904,99 @@ void VulkanSimulation::step(int maxTicks) {
             dispatch(pipelines_[GravityUpPipeline], static_cast<uint32_t>(treeLevels_[level].size()));
         }
         submitProfileSegment("gravity up");
+        if (traceGravityStats) {
+            const auto* multipoles = static_cast<const GpuMultipole*>(multipoles_.mapped);
+            const auto* tree = static_cast<const int32_t*>(tree_.mapped);
+            const auto* gravAbs = static_cast<const float*>(gravAbs_.mapped);
+            uint32_t gravZero = 0;
+            uint32_t gravNonFinite = 0;
+            float gravMin = std::numeric_limits<float>::max();
+            float gravMax = 0.0f;
+            double gravSum = 0.0;
+            for (uint32_t p = 0; p < particleCount_; ++p) {
+                const float g = gravAbs[p];
+                if (!std::isfinite(g)) {
+                    ++gravNonFinite;
+                    continue;
+                }
+                if (g <= 0.0f) ++gravZero;
+                gravMin = std::min(gravMin, g);
+                gravMax = std::max(gravMax, g);
+                gravSum += g;
+            }
+            std::cout << "[gravstats] step=" << diagnosticStepIndex
+                      << " particles=" << particleCount_
+                      << " gravAbs_min=" << gravMin
+                      << " gravAbs_max=" << gravMax
+                      << " gravAbs_mean=" << (particleCount_ > 0 ? gravSum / static_cast<double>(particleCount_) : 0.0)
+                      << " gravAbs_zero=" << gravZero
+                      << " gravAbs_nonfinite=" << gravNonFinite
+                      << "\n";
+            for (size_t level = 0; level < treeLevels_.size(); ++level) {
+                if (treeLevels_[level].empty()) continue;
+                uint32_t branchCount = 0;
+                uint32_t leafCount = 0;
+                uint32_t badData = 0;
+                uint32_t zeroMinGrav = 0;
+                uint32_t nonFiniteMinGrav = 0;
+                uint32_t nonFinitePower = 0;
+                float minMinGrav = std::numeric_limits<float>::max();
+                float maxMinGrav = 0.0f;
+                float minSize = std::numeric_limits<float>::max();
+                float maxSize = 0.0f;
+                float maxPower3 = 0.0f;
+                double meanSize = 0.0;
+                double meanPower3 = 0.0;
+                for (int32_t treePointer : treeLevels_[level]) {
+                    if (treePointer < 0 || static_cast<size_t>(treePointer + 1) >= treeCapacity_) {
+                        ++badData;
+                        continue;
+                    }
+                    const int32_t nParticles = tree[treePointer];
+                    const int32_t dataPointer = tree[treePointer + 1];
+                    if (dataPointer < 0 || static_cast<size_t>(dataPointer) >= nodeCapacity_) {
+                        ++badData;
+                        continue;
+                    }
+                    if (nParticles == 0) ++branchCount;
+                    else ++leafCount;
+                    const GpuMultipole& mp = multipoles[dataPointer];
+                    if (!std::isfinite(mp.minGrav)) ++nonFiniteMinGrav;
+                    else {
+                        if (mp.minGrav <= 0.0f) ++zeroMinGrav;
+                        minMinGrav = std::min(minMinGrav, mp.minGrav);
+                        maxMinGrav = std::max(maxMinGrav, mp.minGrav);
+                    }
+                    if (std::isfinite(mp.size)) {
+                        minSize = std::min(minSize, mp.size);
+                        maxSize = std::max(maxSize, mp.size);
+                        meanSize += mp.size;
+                    }
+                    if (std::isfinite(mp.power[3])) {
+                        maxPower3 = std::max(maxPower3, mp.power[3]);
+                        meanPower3 += mp.power[3];
+                    } else {
+                        ++nonFinitePower;
+                    }
+                }
+                const double nodes = static_cast<double>(treeLevels_[level].size());
+                std::cout << "[gravstats] step=" << diagnosticStepIndex
+                          << " level=" << level
+                          << " nodes=" << treeLevels_[level].size()
+                          << " branches=" << branchCount
+                          << " leaves=" << leafCount
+                          << " bad=" << badData
+                          << " minGrav=" << minMinGrav << ".." << maxMinGrav
+                          << " zeroMinGrav=" << zeroMinGrav
+                          << " nonfiniteMinGrav=" << nonFiniteMinGrav
+                          << " size=" << minSize << ".." << maxSize
+                          << " meanSize=" << (nodes > 0.0 ? meanSize / nodes : 0.0)
+                          << " power3Max=" << maxPower3
+                          << " power3Mean=" << (nodes > 0.0 ? meanPower3 / nodes : 0.0)
+                          << " nonfinitePower=" << nonFinitePower
+                          << "\n";
+            }
+        }
     } else {
         if (kTraceSimulationPasses) std::cout << "  gravity skipped" << std::endl;
     }
@@ -891,6 +1034,68 @@ void VulkanSimulation::step(int maxTicks) {
                 const std::string label = "gravity down level " + std::to_string(level) +
                     " offset " + std::to_string(offset);
                 submitProfileSegment(label.c_str());
+            }
+            if (traceGravityBuffers) {
+                const Buffer& outBuffer = (level & 1u) == 0u ? localGravB_ : localGravA_;
+                const auto* out = static_cast<const int32_t*>(outBuffer.mapped);
+                const auto* tree = static_cast<const int32_t*>(tree_.mapped);
+                const auto* parentIndexes = static_cast<const uint32_t*>(parentIndexes_.mapped);
+                uint32_t noSentinel = 0;
+                uint32_t invalidEntries = 0;
+                int32_t maxUsed = 0;
+                const uint32_t sampleCount = std::min<uint32_t>(levelSize, 8u);
+                std::cout << "[gravbuf] step=" << diagnosticStepIndex
+                          << " level=" << level
+                          << " nodes=" << levelSize
+                          << " stride=" << uncheckedStride
+                          << " parent_stride=" << uncheckedParentStride
+                          << " samples=";
+                for (uint32_t n = 0; n < levelSize; ++n) {
+                    const int32_t base = static_cast<int32_t>(n) * uncheckedStride;
+                    int32_t firstSentinel = uncheckedStride;
+                    for (int32_t s = 0; s < uncheckedStride; ++s) {
+                        const int32_t value = out[base + s];
+                        if (value == -1) {
+                            firstSentinel = s;
+                            break;
+                        }
+                        if (value < 0 || static_cast<size_t>(value + 1) >= treeCapacity_ || tree[value + 1] < 0) {
+                            ++invalidEntries;
+                        }
+                    }
+                    if (firstSentinel == uncheckedStride) ++noSentinel;
+                    maxUsed = std::max(maxUsed, firstSentinel);
+                    if (n < sampleCount) {
+                        if (n != 0) std::cout << ",";
+                        std::cout << firstSentinel;
+                    }
+                }
+                std::cout << " max_used=" << maxUsed
+                          << " no_sentinel=" << noSentinel
+                          << " invalid_entries=" << invalidEntries;
+                if (level + 1 < treeLevels_.size() && !treeLevels_[level + 1].empty()) {
+                    uint32_t minParent = std::numeric_limits<uint32_t>::max();
+                    uint32_t maxParent = 0;
+                    uint32_t badParent = 0;
+                    for (int32_t childTreePointer : treeLevels_[level + 1]) {
+                        if (childTreePointer < 0 || static_cast<size_t>(childTreePointer + 1) >= treeCapacity_) {
+                            ++badParent;
+                            continue;
+                        }
+                        const int32_t childData = tree[childTreePointer + 1];
+                        if (childData < 0 || static_cast<size_t>(childData) >= nodeCapacity_) {
+                            ++badParent;
+                            continue;
+                        }
+                        const uint32_t parent = parentIndexes[childData];
+                        minParent = std::min(minParent, parent);
+                        maxParent = std::max(maxParent, parent);
+                        if (parent >= levelSize) ++badParent;
+                    }
+                    std::cout << " next_parent_range=" << minParent << ".." << maxParent
+                              << " bad_next_parent=" << badParent;
+                }
+                std::cout << "\n";
             }
             uncheckedParentStride = uncheckedStride;
         }
@@ -990,11 +1195,21 @@ void VulkanSimulation::step(int maxTicks) {
     if (kTraceSimulationPasses) std::cout << "Submitting GPU simulation step..." << std::endl;
     if (recordedCommands) {
         const auto submitStart = std::chrono::steady_clock::now();
+        if (traceSegments) {
+            std::cout << "[trace] step=" << diagnosticStepIndex
+                      << " ticks=" << globalTimeTicks_
+                      << " submit final segment" << std::endl;
+        }
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &commandBuffer_;
         check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit");
-        check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        waitForSimulationFence("vkWaitForFences final segment");
+        if (traceSegments) {
+            std::cout << "[trace] step=" << diagnosticStepIndex
+                      << " ticks=" << globalTimeTicks_
+                      << " done final segment" << std::endl;
+        }
         if (profileStep) {
             const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - submitStart;
             std::cout << "[profile] gpu final segment: " << elapsed.count() << " ms\n";

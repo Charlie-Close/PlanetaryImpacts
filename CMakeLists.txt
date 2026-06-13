@@ -57,6 +57,74 @@ endif()
 
 find_program(GLSLC_EXECUTABLE glslc)
 if (SPH_VULKAN_BUILD_SHADERS AND GLSLC_EXECUTABLE)
+    file(READ "${CMAKE_CURRENT_LIST_DIR}/include/sph/Parameters.hpp" SPH_PARAMETERS_HPP)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/include/sph/Parameters.hpp"
+    )
+
+    function(sph_extract_param NAME OUT_VAR)
+        string(REGEX MATCH "inline constexpr (float|int) ${NAME} = ([^\n;]+);" _MATCH "${SPH_PARAMETERS_HPP}")
+        if (NOT _MATCH)
+            message(FATAL_ERROR "Could not extract sph::params::${NAME} for shader generation")
+        endif()
+        set(_VALUE "${CMAKE_MATCH_2}")
+        string(REPLACE "params::" "" _VALUE "${_VALUE}")
+        string(REPLACE "f" "" _VALUE "${_VALUE}")
+        string(STRIP "${_VALUE}" _VALUE)
+        set(${OUT_VAR} "${_VALUE}" PARENT_SCOPE)
+    endfunction()
+
+    sph_extract_param(viscosityAlpha SPH_VISCOSITY_ALPHA)
+    sph_extract_param(viscosityBeta SPH_VISCOSITY_BETA)
+    sph_extract_param(alphaMin SPH_ALPHA_MIN)
+    sph_extract_param(alphaMax SPH_ALPHA_MAX)
+    sph_extract_param(densityEta SPH_DENSITY_ETA)
+    sph_extract_param(maxSmoothingLength SPH_MAX_SMOOTHING_LENGTH)
+    sph_extract_param(maxDensityIterations SPH_MAX_DENSITY_NR_ITERATIONS)
+    sph_extract_param(neighboursEstimate SPH_N_NEIGHBOURS_ESTIM)
+    sph_extract_param(resolutionEta SPH_RESOLUTION_ETA)
+    sph_extract_param(particleInRangeThreshold SPH_PARTICLE_IN_RANGE_THRESHOLD)
+    sph_extract_param(cfl SPH_CFL)
+    sph_extract_param(gdt SPH_GDT)
+    sph_extract_param(minDt SPH_MIN_DT)
+    sph_extract_param(maxDt SPH_MAX_DT)
+    sph_extract_param(gamma SPH_GAMMA)
+    sph_extract_param(kernelConstant SPH_KERNEL_CONSTANT)
+    sph_extract_param(gravitySmoothingLength SPH_GRAVITY_SMOOTHING_LENGTH)
+    sph_extract_param(plumberEquivalent SPH_PLUMBER_EQUIVALENT)
+    sph_extract_param(gravityEta SPH_GRAVITY_ETA)
+    sph_extract_param(expansionTerms SPH_N_EXPANSION_TERMS)
+    sph_extract_param(maxLocalUncheckedPointers SPH_MAX_LOCAL_UNCHECKED_POINTERS)
+    sph_extract_param(gravityMaxRecursion SPH_GRAVITY_MAX_RECURSION)
+    sph_extract_param(maxFloat SPH_MAX_FLOAT)
+    sph_extract_param(cellWidth SPH_CELL_WIDTH)
+    sph_extract_param(cellPower SPH_CELL_POWER)
+    sph_extract_param(sortingBlockSize SPH_SORTING_BLOCK_SIZE)
+    sph_extract_param(sortingMaskLength SPH_SORTING_MASK_LENGTH)
+    math(EXPR SPH_SORTING_BUCKET_NUMBER "1 << ${SPH_SORTING_MASK_LENGTH}")
+    math(EXPR SPH_SORTING_BIT_MASK "${SPH_SORTING_BUCKET_NUMBER} - 1")
+
+    string(REGEX MATCH "inline constexpr Vec3 lightDirection = \\{([^,]+), ([^,]+), ([^,]+)," _LIGHT_MATCH "${SPH_PARAMETERS_HPP}")
+    if (NOT _LIGHT_MATCH)
+        message(FATAL_ERROR "Could not extract sph::params::lightDirection for shader generation")
+    endif()
+    set(SPH_LIGHT_X "${CMAKE_MATCH_1}")
+    set(SPH_LIGHT_Y "${CMAKE_MATCH_2}")
+    set(SPH_LIGHT_Z "${CMAKE_MATCH_3}")
+    string(REPLACE "f" "" SPH_LIGHT_X "${SPH_LIGHT_X}")
+    string(REPLACE "f" "" SPH_LIGHT_Y "${SPH_LIGHT_Y}")
+    string(REPLACE "f" "" SPH_LIGHT_Z "${SPH_LIGHT_Z}")
+    string(STRIP "${SPH_LIGHT_X}" SPH_LIGHT_X)
+    string(STRIP "${SPH_LIGHT_Y}" SPH_LIGHT_Y)
+    string(STRIP "${SPH_LIGHT_Z}" SPH_LIGHT_Z)
+
+    set(SPH_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders")
+    configure_file(
+        "${CMAKE_CURRENT_LIST_DIR}/shaders/sph_params.glsl.in"
+        "${SPH_GENERATED_SHADER_DIR}/sph_params.glsl"
+        @ONLY
+    )
+
     file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_LIST_DIR}/shaders/*.comp"
         "${CMAKE_CURRENT_LIST_DIR}/shaders/*.vert"
@@ -69,8 +137,8 @@ if (SPH_VULKAN_BUILD_SHADERS AND GLSLC_EXECUTABLE)
         add_custom_command(
             OUTPUT "${SPIRV}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-            COMMAND "${GLSLC_EXECUTABLE}" "${SHADER}" -o "${SPIRV}"
-            DEPENDS "${SHADER}"
+            COMMAND "${GLSLC_EXECUTABLE}" -I "${SPH_GENERATED_SHADER_DIR}" "${SHADER}" -o "${SPIRV}"
+            DEPENDS "${SHADER}" "${SPH_GENERATED_SHADER_DIR}/sph_params.glsl"
             VERBATIM
         )
         list(APPEND SPIRV_OUTPUTS "${SPIRV}")
