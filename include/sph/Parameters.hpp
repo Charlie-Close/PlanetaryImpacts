@@ -57,9 +57,9 @@ inline constexpr int shuffleFrames = 64;
 
 inline constexpr float particleSize = 160.0f;
 inline constexpr int snapshotResolution = 1024;
-inline constexpr int startSnapshot = 33;
+inline constexpr int startSnapshot = 0;
 inline constexpr int snapshotPeriodSeconds = 25;
-inline constexpr int nSnapshotters = 1;
+inline constexpr int nSnapshotters = 4;
 inline constexpr int boxCenter = 318;
 inline constexpr int boxSize = 318;
 inline constexpr Vec3 startingPosition = {315.0f, 355.0f, 100.0f, 0.0f};
