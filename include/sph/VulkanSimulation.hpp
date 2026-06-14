@@ -129,7 +129,7 @@ private:
     void startAsyncOctreeBuild();
     void destroyBuffer(Buffer& buffer);
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-    uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags) const;
+    uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferredFlags = 0) const;
     VkShaderModule shaderModule(const std::string& path) const;
     void check(VkResult result, const char* what) const;
 
@@ -138,6 +138,8 @@ private:
     int32_t globalTimeTicks_ = 0;
     uint64_t diagnosticStepIndex_ = 0;
     std::string deviceName_;
+    bool preferDeviceLocalHostVisible_ = false;
+    bool segmentSimulationSubmits_ = false;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
@@ -148,7 +150,9 @@ private:
     bool ownsDevice_ = true;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
+    VkCommandBuffer octreeReadbackCommandBuffer_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    VkFence octreeReadbackFence_ = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
@@ -166,6 +170,8 @@ private:
     Buffer materialIds_;
     Buffer temperatures_;
     Buffer alive_;
+    Buffer octreePositionsReadback_;
+    Buffer octreeAliveReadback_;
     Buffer accelerations_;
     Buffer gravAccelerations_;
     Buffer dInternalEnergy_;

@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -36,6 +37,21 @@ std::filesystem::path projectRoot() {
 #else
     return std::filesystem::current_path().parent_path();
 #endif
+}
+
+std::string shellQuote(const std::string& value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+int videoFps() {
+    if (const char* env = std::getenv("SPH_VIDEO_FPS")) return std::max(1, std::atoi(env));
+    return 30;
 }
 
 void usage(const char* argv0) {
@@ -153,24 +169,34 @@ int main(int argc, char** argv) {
             sph::VulkanSimulation gpuSimulation(simulator);
             std::cout << "Simulation Vulkan device: " << gpuSimulation.deviceName() << "\n";
             const bool quietSteps = std::getenv("SPH_QUIET_STEPS") != nullptr;
+            constexpr double fpsSmoothingAlpha = 0.05;
+            double smoothedFps = 0.0;
+            std::array<int, sph::params::nSnapshotters> videoFrameCounts{};
+            if (options.snapshots) {
+                for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
+                    const auto folder = options.snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
+                    std::filesystem::create_directories(folder);
+                    std::filesystem::remove(folder / "frames.rgba");
+                }
+            }
             int nextSnapshot = 0;
             for (int i = 0; i < options.steps; ++i) {
-                const auto start = std::chrono::steady_clock::now();
+                const auto loopStart = std::chrono::steady_clock::now();
+                const auto simStart = loopStart;
                 gpuSimulation.step();
-                const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
-                if (!quietSteps) {
-                    std::cout << "GPU step " << (i + 1) << "/" << options.steps
-                              << " time=" << simulator.time() << "s wall=" << elapsed.count() << "s\n";
-                }
+                const std::chrono::duration<double> simElapsed = std::chrono::steady_clock::now() - simStart;
                 if (options.snapshots && simulator.time() > static_cast<float>(nextSnapshot)) {
                     const int initialSnapshot = static_cast<int>(std::round(sph::params::startSnapshot * (1000.0f / sph::params::snapshotPeriodSeconds)));
                     const int currentFrame = static_cast<int>(std::round(static_cast<float>(nextSnapshot) / sph::params::snapshotPeriodSeconds));
                     for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
                         const auto folder = options.snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
-                        gpuSimulation.writeSnapshot(folder / ("snapshot_" + std::to_string(initialSnapshot + currentFrame) + ".png"),
+                        (void)initialSnapshot;
+                        (void)currentFrame;
+                        gpuSimulation.writeSnapshot(folder / "frames.rgba",
                                                     sph::params::snapshotPositions[snapshotter],
                                                     sph::params::snapshotPitches[snapshotter],
                                                     sph::params::snapshotYaws[snapshotter]);
+                        ++videoFrameCounts[snapshotter];
                     }
                     if (options.saveState && (nextSnapshot % 1000) == 0 && simulator.time() > 500.0f) {
                         gpuSimulation.syncToSimulator();
@@ -179,6 +205,35 @@ int main(int argc, char** argv) {
                         simulator.saveState(savePath);
                     }
                     nextSnapshot += sph::params::snapshotPeriodSeconds;
+                }
+                const std::chrono::duration<double> loopElapsed = std::chrono::steady_clock::now() - loopStart;
+                const double simSeconds = simElapsed.count();
+                const double loopSeconds = loopElapsed.count();
+                const double fps = loopSeconds > 0.0 ? 1.0 / loopSeconds : 0.0;
+                smoothedFps = smoothedFps == 0.0 ? fps : (fpsSmoothingAlpha * fps + (1.0 - fpsSmoothingAlpha) * smoothedFps);
+                if (!quietSteps) {
+                    std::cout << "GPU step " << (i + 1) << "/" << options.steps
+                              << " time=" << simulator.time() << "s"
+                              << " sim_wall=" << simSeconds << "s"
+                              << " loop_wall=" << loopSeconds << "s"
+                              << " fps=" << fps << " smooth_fps=" << smoothedFps << "\n";
+                }
+            }
+            if (options.snapshots) {
+                const int fps = videoFps();
+                const bool keepRawFrames = std::getenv("SPH_KEEP_RAW_FRAMES") != nullptr;
+                for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
+                    if (videoFrameCounts[snapshotter] == 0) continue;
+                    const auto folder = options.snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
+                    const auto rawPath = folder / "frames.rgba";
+                    const auto videoPath = folder / ("snapshotter_" + std::to_string(snapshotter) + ".mp4");
+                    const std::string command = "ffmpeg -y -hide_banner -loglevel error -f rawvideo -pixel_format rgba -video_size " +
+                        std::to_string(sph::params::snapshotResolution) + "x" + std::to_string(sph::params::snapshotResolution) +
+                        " -framerate " + std::to_string(fps) + " -i " + shellQuote(rawPath.string()) +
+                        " -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p " + shellQuote(videoPath.string());
+                    std::cout << "Encoding " << videoPath << " from " << videoFrameCounts[snapshotter] << " frames..." << std::endl;
+                    if (std::system(command.c_str()) != 0) throw std::runtime_error("ffmpeg video encode failed: " + videoPath.string());
+                    if (!keepRawFrames) std::filesystem::remove(rawPath);
                 }
             }
             gpuSimulation.syncToSimulator();

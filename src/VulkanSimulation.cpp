@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -140,6 +141,9 @@ VulkanSimulation::~VulkanSimulation() {
     // MoltenVK can wedge indefinitely in a redundant process-exit vkDeviceWaitIdle()
     // after long compute runs, so keep the global idle wait opt-in for diagnostics.
     if (device_ && std::getenv("SPH_WAIT_IDLE_ON_DESTROY") != nullptr) vkDeviceWaitIdle(device_);
+    if (pendingOctree_.valid()) pendingOctree_.wait();
+    destroyBuffer(octreeAliveReadback_);
+    destroyBuffer(octreePositionsReadback_);
     destroyBuffer(alive_);
     destroyBuffer(temperatures_);
     destroyBuffer(materialIds_);
@@ -222,6 +226,7 @@ VulkanSimulation::~VulkanSimulation() {
     }
     if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
     if (descriptorSetLayout_) vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
+    if (octreeReadbackFence_) vkDestroyFence(device_, octreeReadbackFence_, nullptr);
     if (fence_) vkDestroyFence(device_, fence_, nullptr);
     if (commandPool_) vkDestroyCommandPool(device_, commandPool_, nullptr);
     if (ownsDevice_ && device_) vkDestroyDevice(device_, nullptr);
@@ -299,6 +304,8 @@ void VulkanSimulation::createDevice() {
         return std::string(ext.extensionName) == "VK_KHR_portability_subset";
     });
     if (hasPortabilitySubset) extensions.push_back("VK_KHR_portability_subset");
+    preferDeviceLocalHostVisible_ = !hasPortabilitySubset;
+    segmentSimulationSubmits_ = hasPortabilitySubset;
 
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.queueCreateInfoCount = 1;
@@ -320,14 +327,21 @@ void VulkanSimulation::createCommandResources() {
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
     check(vkAllocateCommandBuffers(device_, &alloc, &commandBuffer_), "vkAllocateCommandBuffers");
+    check(vkAllocateCommandBuffers(device_, &alloc, &octreeReadbackCommandBuffer_), "vkAllocateCommandBuffers octree readback");
 
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     check(vkCreateFence(device_, &fenceInfo, nullptr, &fence_), "vkCreateFence");
+    check(vkCreateFence(device_, &fenceInfo, nullptr, &octreeReadbackFence_), "vkCreateFence octree readback");
 }
 
-uint32_t VulkanSimulation::findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags) const {
+uint32_t VulkanSimulation::findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferredFlags) const {
     VkPhysicalDeviceMemoryProperties props{};
     vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &props);
+    if (preferredFlags != 0) {
+        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags) return i;
+        }
+    }
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
         if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags) return i;
     }
@@ -346,7 +360,11 @@ VulkanSimulation::Buffer VulkanSimulation::createBuffer(VkDeviceSize size, VkBuf
     vkGetBufferMemoryRequirements(device_, out.buffer, &req);
     VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = findMemory(req.memoryTypeBits, properties);
+    const bool preferDeviceLocal = preferDeviceLocalHostVisible_ &&
+        (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0 &&
+        (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    const VkMemoryPropertyFlags preferred = preferDeviceLocal ? (properties | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : 0;
+    alloc.memoryTypeIndex = findMemory(req.memoryTypeBits, properties, preferred);
     check(vkAllocateMemory(device_, &alloc, nullptr, &out.memory), "vkAllocateMemory");
     check(vkBindBufferMemory(device_, out.buffer, out.memory, 0), "vkBindBufferMemory");
     if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -364,7 +382,7 @@ void VulkanSimulation::destroyBuffer(Buffer& buffer) {
 
 void VulkanSimulation::createBuffers() {
     const VkMemoryPropertyFlags hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto n = static_cast<VkDeviceSize>(particleCount_);
     positions_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
     velocities_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
@@ -376,6 +394,8 @@ void VulkanSimulation::createBuffers() {
     materialIds_ = createBuffer(n * sizeof(int32_t), storage, hostCoherent);
     temperatures_ = createBuffer(n * sizeof(float), storage, hostCoherent);
     alive_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
+    octreePositionsReadback_ = createBuffer(n * sizeof(Vec3), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
+    octreeAliveReadback_ = createBuffer(n * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
     accelerations_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
     gravAccelerations_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
     dInternalEnergy_ = createBuffer(n * sizeof(float), storage, hostCoherent);
@@ -584,24 +604,64 @@ void VulkanSimulation::applyPendingOctreeBuild(bool profileStep) {
 }
 
 void VulkanSimulation::startAsyncOctreeBuild() {
+    const bool profileStep = std::getenv("SPH_PROFILE_STEPS") != nullptr;
+    const auto totalStart = std::chrono::steady_clock::now();
     if (pendingOctree_.valid()) {
-        if (pendingOctree_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        if (pendingOctree_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            if (profileStep) std::cout << "[profile] cpu octree pending: still building\n";
+            return;
+        }
+        const auto applyStart = std::chrono::steady_clock::now();
         OctreeData octree = pendingOctree_.get();
         if (!pendingOctreeStale_) {
             applyOctreeData(octree);
         }
         pendingOctreeStale_ = false;
+        if (profileStep) {
+            const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - applyStart;
+            std::cout << "[profile] cpu octree finish/apply: " << elapsed.count() << " ms\n";
+        }
     }
-    std::vector<Vec3> positions(particleCount_);
-    copyFromMapped(positions, positions_);
-    std::vector<uint32_t> alive(aliveHost_.size());
-    std::memcpy(alive.data(), alive_.mapped, alive.size() * sizeof(uint32_t));
-    const size_t estimatedTreeSize = std::max<size_t>(treeCapacity_, positions.size() * 2);
-    pendingOctree_ = std::async(std::launch::async, [positions = std::move(positions),
-                                                     alive = std::move(alive),
-                                                     estimatedTreeSize]() {
+    const auto readStart = std::chrono::steady_clock::now();
+    check(vkResetFences(device_, 1, &octreeReadbackFence_), "vkResetFences octree readback");
+    check(vkResetCommandBuffer(octreeReadbackCommandBuffer_, 0), "vkResetCommandBuffer octree readback");
+    VkCommandBufferBeginInfo readBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    readBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(octreeReadbackCommandBuffer_, &readBegin), "vkBeginCommandBuffer octree readback");
+    VkBufferCopy positionsCopy{};
+    positionsCopy.size = positions_.size;
+    vkCmdCopyBuffer(octreeReadbackCommandBuffer_, positions_.buffer, octreePositionsReadback_.buffer, 1, &positionsCopy);
+    VkBufferCopy aliveCopy{};
+    aliveCopy.size = alive_.size;
+    vkCmdCopyBuffer(octreeReadbackCommandBuffer_, alive_.buffer, octreeAliveReadback_.buffer, 1, &aliveCopy);
+    check(vkEndCommandBuffer(octreeReadbackCommandBuffer_), "vkEndCommandBuffer octree readback");
+    VkSubmitInfo readSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    readSubmit.commandBufferCount = 1;
+    readSubmit.pCommandBuffers = &octreeReadbackCommandBuffer_;
+    check(vkQueueSubmit(queue_, 1, &readSubmit, octreeReadbackFence_), "vkQueueSubmit octree readback");
+    if (profileStep) {
+        const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - readStart;
+        std::cout << "[profile] cpu octree readback submit: " << elapsed.count() << " ms\n";
+    }
+    const size_t estimatedTreeSize = std::max<size_t>(treeCapacity_, static_cast<size_t>(particleCount_) * 2);
+    pendingOctree_ = std::async(std::launch::async, [this, estimatedTreeSize, profileStep]() {
+        const auto asyncStart = std::chrono::steady_clock::now();
+        const VkResult waitResult = vkWaitForFences(device_, 1, &octreeReadbackFence_, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS) throw std::runtime_error("vkWaitForFences octree async readback failed");
+        std::vector<Vec3> positions(particleCount_);
+        std::vector<uint32_t> alive(aliveHost_.size());
+        std::memcpy(positions.data(), octreePositionsReadback_.mapped, positions.size() * sizeof(Vec3));
+        std::memcpy(alive.data(), octreeAliveReadback_.mapped, alive.size() * sizeof(uint32_t));
+        if (profileStep) {
+            const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - asyncStart;
+            std::cout << "[profile] cpu octree async readback wait/copy: " << elapsed.count() << " ms\n";
+        }
         return buildOctree(positions, alive, 8, estimatedTreeSize);
     });
+    if (profileStep) {
+        const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - totalStart;
+        std::cout << "[profile] cpu octree schedule total: " << elapsed.count() << " ms\n";
+    }
 }
 
 VkShaderModule VulkanSimulation::shaderModule(const std::string& path) const {
@@ -812,7 +872,10 @@ void VulkanSimulation::step(int maxTicks) {
         }
         check(result, label.c_str());
     };
+    const bool forceSegmentSubmits = segmentSimulationSubmits_ ||
+        profileStep || traceSegments || traceGravityBuffers || traceGravityStats || slowSegmentMs > 0.0;
     auto submitProfileSegment = [&](const char* label) {
+        if (!forceSegmentSubmits) return;
         check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer profile segment");
         const auto submitStart = std::chrono::steady_clock::now();
         if (recordedCommands) {
@@ -1840,11 +1903,18 @@ void VulkanSimulation::writeSnapshot(const std::filesystem::path& path, Vec3 cam
         check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences snapshot");
 
         std::filesystem::create_directories(path.parent_path().empty() ? "." : path.parent_path());
-        std::vector<unsigned char> png;
         const auto* rgba = static_cast<const unsigned char*>(readbackBuffer.mapped);
-        unsigned error = lodepng::encode(png, rgba, snapshotSize, snapshotSize);
-        if (error) throw std::runtime_error("PNG encode failed: " + std::string(lodepng_error_text(error)));
-        lodepng::save_file(png, path.string());
+        if (path.extension() == ".rgba") {
+            std::ofstream out(path, std::ios::binary | std::ios::app);
+            if (!out) throw std::runtime_error("Could not open raw snapshot stream: " + path.string());
+            out.write(reinterpret_cast<const char*>(rgba), static_cast<std::streamsize>(static_cast<size_t>(snapshotSize) * snapshotSize * 4u));
+            if (!out) throw std::runtime_error("Could not write raw snapshot frame: " + path.string());
+        } else {
+            std::vector<unsigned char> png;
+            unsigned error = lodepng::encode(png, rgba, snapshotSize, snapshotSize);
+            if (error) throw std::runtime_error("PNG encode failed: " + std::string(lodepng_error_text(error)));
+            lodepng::save_file(png, path.string());
+        }
         cleanup();
     } catch (...) {
         cleanup();
