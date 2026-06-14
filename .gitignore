@@ -1,3 +1,4 @@
 build
 sph_metal
 sph_vulkan_output
+*.hdf5
