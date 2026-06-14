@@ -397,7 +397,11 @@ void VulkanViewer::createSwapchain() {
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice_, surface_, &formatCount, formats.data());
     VkSurfaceFormatKHR chosen = formats[0];
     for (const auto& f : formats) {
-        if (f.format == VK_FORMAT_B8G8R8A8_SRGB || f.format == VK_FORMAT_B8G8R8A8_UNORM) chosen = f;
+        if (f.format == VK_FORMAT_B8G8R8A8_SRGB) {
+            chosen = f;
+            break;
+        }
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM) chosen = f;
     }
     int w = 0, h = 0;
     glfwGetFramebufferSize(window_, &w, &h);
@@ -563,7 +567,7 @@ void VulkanViewer::createPipeline() {
     vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
     vertexInput.pVertexAttributeDescriptions = attrs.data();
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport viewport{0, 0, static_cast<float>(swapchainExtent_.width), static_cast<float>(swapchainExtent_.height), 0, 1};
     VkRect2D scissor{{0, 0}, swapchainExtent_};
     VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -606,7 +610,7 @@ void VulkanViewer::createShadowPipeline() {
     vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
     vertexInput.pVertexAttributeDescriptions = attrs.data();
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport viewport{0, 0, 1024.0f, 1024.0f, 0, 1};
     VkRect2D scissor{{0, 0}, {1024, 1024}};
     VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};

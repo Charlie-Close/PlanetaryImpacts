@@ -19,7 +19,6 @@ layout(location = 0) out vec4 outColour;
 float calculateShadow(vec4 positionInLightSpace) {
     vec3 p = positionInLightSpace.xyz / positionInLightSpace.w;
     vec2 lightSpaceCoord = p.xy * 0.5 + 0.5;
-    lightSpaceCoord.y = 1.0 - lightSpaceCoord.y;
     if (lightSpaceCoord.x < 0.0 || lightSpaceCoord.y < 0.0 || lightSpaceCoord.x > 1.0 || lightSpaceCoord.y > 1.0) {
         return 0.0;
     }

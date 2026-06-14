@@ -47,8 +47,8 @@ inline constexpr int maxLocalUncheckedPointers = 256;
 inline constexpr int gravityMaxRecursion = 8;
 inline constexpr float maxFloat = 3.402823466e38f;
 
-inline constexpr float cellWidth = 0.15f;
-inline constexpr int cellPower = 8;
+inline constexpr float cellWidth = 0.30f;
+inline constexpr int cellPower = 7;
 inline constexpr int sortingBlockSize = 256;
 inline constexpr int sortingMaskLength = 8;
 inline constexpr int sortingBucketNumber = 1 << sortingMaskLength;
