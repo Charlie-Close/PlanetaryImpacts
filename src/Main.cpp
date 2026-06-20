@@ -1,8 +1,9 @@
-#include <filesystem>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -54,12 +55,37 @@ int videoFps() {
     return 30;
 }
 
+using SnapshotFrameCounts = std::array<int, sph::params::nSnapshotters>;
+
+void encodeSnapshotVideos(const std::filesystem::path& snapshotDir,
+                          const SnapshotFrameCounts& videoFrameCounts,
+                          bool finalEncode) {
+    const int fps = videoFps();
+    const bool keepRawFrames = std::getenv("SPH_KEEP_RAW_FRAMES") != nullptr;
+    for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
+        if (videoFrameCounts[snapshotter] == 0) continue;
+        const auto folder = snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
+        const auto rawPath = folder / "frames.rgba";
+        const auto videoPath = folder / ("snapshotter_" + std::to_string(snapshotter) + ".mp4");
+        const std::string command = "ffmpeg -y -hide_banner -loglevel error -f rawvideo -pixel_format rgba -video_size " +
+            std::to_string(sph::params::snapshotResolution) + "x" + std::to_string(sph::params::snapshotResolution) +
+            " -framerate " + std::to_string(fps) + " -i " + shellQuote(rawPath.string()) +
+            " -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p " + shellQuote(videoPath.string());
+        std::cout << (finalEncode ? "Encoding " : "Updating ")
+                  << videoPath << " from " << videoFrameCounts[snapshotter] << " frames..." << std::endl;
+        if (std::system(command.c_str()) != 0) throw std::runtime_error("ffmpeg video encode failed: " + videoPath.string());
+        if (finalEncode && !keepRawFrames) std::filesystem::remove(rawPath);
+    }
+}
+
 void usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
         << "  --input PATH          HDF5 input. Defaults to Metal FILEPATH, then demo_impact_n50.hdf5 if present.\n"
         << "  --output PATH         HDF5 output path for final state.\n"
         << "  --snapshot-dir PATH   Directory for PNG snapshots.\n"
+        << "  --video-interval-seconds N\n"
+        << "                       Encode headless snapshot videos every N simulation seconds. Default: 1000; 0 disables interim video writes.\n"
         << "  --steps N            Number of simulation steps. Default: 1.\n"
         << "  --max-particles N    Run only the first N particles, useful for quick compatibility tests.\n"
         << "  --no-snapshot        Do not render a PNG snapshot.\n"
@@ -90,6 +116,7 @@ sph::RunOptions parseOptions(int argc, char** argv) {
         if (arg == "--input") options.input = needValue("--input");
         else if (arg == "--output") options.output = needValue("--output");
         else if (arg == "--snapshot-dir") options.snapshotDir = needValue("--snapshot-dir");
+        else if (arg == "--video-interval-seconds") options.videoIntervalSeconds = std::stoi(needValue("--video-interval-seconds"));
         else if (arg == "--steps") options.steps = std::stoi(needValue("--steps"));
         else if (arg == "--max-particles") options.maxParticles = std::stoi(needValue("--max-particles"));
         else if (arg == "--no-snapshot") options.snapshots = false;
@@ -120,6 +147,7 @@ sph::RunOptions parseOptions(int argc, char** argv) {
             throw std::runtime_error("Unknown option: " + arg);
         }
     }
+    if (options.videoIntervalSeconds < 0) throw std::runtime_error("--video-interval-seconds must be >= 0");
     return options;
 }
 
@@ -171,7 +199,7 @@ int main(int argc, char** argv) {
             const bool quietSteps = std::getenv("SPH_QUIET_STEPS") != nullptr;
             constexpr double fpsSmoothingAlpha = 0.05;
             double smoothedFps = 0.0;
-            std::array<int, sph::params::nSnapshotters> videoFrameCounts{};
+            SnapshotFrameCounts videoFrameCounts{};
             if (options.snapshots) {
                 for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
                     const auto folder = options.snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
@@ -180,6 +208,7 @@ int main(int argc, char** argv) {
                 }
             }
             int nextSnapshot = 0;
+            int nextVideoWrite = options.videoIntervalSeconds;
             for (int i = 0; i < options.steps; ++i) {
                 const auto loopStart = std::chrono::steady_clock::now();
                 const auto simStart = loopStart;
@@ -206,6 +235,13 @@ int main(int argc, char** argv) {
                     }
                     nextSnapshot += sph::params::snapshotPeriodSeconds;
                 }
+                if (options.snapshots && options.videoIntervalSeconds > 0 &&
+                    simulator.time() >= static_cast<float>(nextVideoWrite)) {
+                    encodeSnapshotVideos(options.snapshotDir, videoFrameCounts, false);
+                    do {
+                        nextVideoWrite += options.videoIntervalSeconds;
+                    } while (simulator.time() >= static_cast<float>(nextVideoWrite));
+                }
                 const std::chrono::duration<double> loopElapsed = std::chrono::steady_clock::now() - loopStart;
                 const double simSeconds = simElapsed.count();
                 const double loopSeconds = loopElapsed.count();
@@ -220,21 +256,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (options.snapshots) {
-                const int fps = videoFps();
-                const bool keepRawFrames = std::getenv("SPH_KEEP_RAW_FRAMES") != nullptr;
-                for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
-                    if (videoFrameCounts[snapshotter] == 0) continue;
-                    const auto folder = options.snapshotDir / ("snapshotter_" + std::to_string(snapshotter));
-                    const auto rawPath = folder / "frames.rgba";
-                    const auto videoPath = folder / ("snapshotter_" + std::to_string(snapshotter) + ".mp4");
-                    const std::string command = "ffmpeg -y -hide_banner -loglevel error -f rawvideo -pixel_format rgba -video_size " +
-                        std::to_string(sph::params::snapshotResolution) + "x" + std::to_string(sph::params::snapshotResolution) +
-                        " -framerate " + std::to_string(fps) + " -i " + shellQuote(rawPath.string()) +
-                        " -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p " + shellQuote(videoPath.string());
-                    std::cout << "Encoding " << videoPath << " from " << videoFrameCounts[snapshotter] << " frames..." << std::endl;
-                    if (std::system(command.c_str()) != 0) throw std::runtime_error("ffmpeg video encode failed: " + videoPath.string());
-                    if (!keepRawFrames) std::filesystem::remove(rawPath);
-                }
+                encodeSnapshotVideos(options.snapshotDir, videoFrameCounts, true);
             }
             gpuSimulation.syncToSimulator();
             if (options.saveState && !options.output.empty()) simulator.saveState(options.output);

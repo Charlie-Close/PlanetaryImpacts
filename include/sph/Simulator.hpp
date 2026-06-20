@@ -15,6 +15,7 @@ struct RunOptions {
     std::filesystem::path snapshotDir;
     int steps = 1;
     int maxParticles = 0;
+    int videoIntervalSeconds = 1000;
     bool snapshots = true;
     bool saveState = true;
     bool validateOnly = false;

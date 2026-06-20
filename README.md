@@ -31,6 +31,7 @@ Useful flags:
 - `--input PATH`: HDF5 initial conditions. Defaults to `demo_impact_n50.hdf5`.
 - `--output PATH`: final HDF5 save path.
 - `--snapshot-dir PATH`: PNG snapshot output directory.
+- `--video-interval-seconds N`: encode headless snapshot videos every N simulation seconds; defaults to `1000`, and `0` disables interim video writes.
 - `--steps N`: number of simulation steps.
 - `--max-particles N`: cap particle count for quick tests.
 - `--window`: open the interactive viewer. This is the default.
