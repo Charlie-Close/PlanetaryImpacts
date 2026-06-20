@@ -209,7 +209,7 @@ void main() {
                         if (alive[j] == 0u || largeCells[j] != large) continue;
                         vec3 xij = positions[j].xyz - p;
                         float r2 = dot(xij, xij);
-                        if (r2 > support) continue;
+                        if (r2 > support2) continue;
                         float r = sqrt(r2);
                         if (nNeighbours < N_NEIGHBOURS_ESTIM) {
                             neighbourIndex[nNeighbours] = j;

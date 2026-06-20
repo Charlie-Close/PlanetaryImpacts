@@ -40,6 +40,16 @@ void copyFromMapped(std::vector<T>& values, const VulkanSimulation::Buffer& buff
     if (!values.empty()) std::memcpy(values.data(), buffer.mapped, sizeof(T) * values.size());
 }
 
+bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
+    uint32_t extensionCount = 0;
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+    std::vector<VkExtensionProperties> available(extensionCount);
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, available.data());
+    return std::any_of(available.begin(), available.end(), [name](const auto& ext) {
+        return std::strcmp(ext.extensionName, name) == 0;
+    });
+}
+
 std::array<float, 16> multiply4x4(const std::array<float, 16>& a, const std::array<float, 16>& b) {
     std::array<float, 16> out{};
     for (int col = 0; col < 4; ++col) {
@@ -126,6 +136,9 @@ VulkanSimulation::VulkanSimulation(Simulator& simulator,
     particleCount_ = static_cast<uint32_t>(simulator_.particleCount());
     if (particleCount_ == 0) throw std::runtime_error("Cannot create a Vulkan simulation with zero particles");
     deviceName_ = std::move(deviceName);
+    const bool hasPortabilitySubset = hasDeviceExtension(physicalDevice_, "VK_KHR_portability_subset");
+    preferDeviceLocalHostVisible_ = !hasPortabilitySubset;
+    segmentSimulationSubmits_ = hasPortabilitySubset;
     std::cout << "Creating simulation command resources..." << std::endl;
     createCommandResources();
     std::cout << "Creating simulation buffers..." << std::endl;
@@ -295,14 +308,8 @@ void VulkanSimulation::createDevice() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
 
-    uint32_t deviceExtensionCount = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &deviceExtensionCount, nullptr);
-    std::vector<VkExtensionProperties> available(deviceExtensionCount);
-    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &deviceExtensionCount, available.data());
     std::vector<const char*> extensions;
-    const bool hasPortabilitySubset = std::any_of(available.begin(), available.end(), [](const auto& ext) {
-        return std::string(ext.extensionName) == "VK_KHR_portability_subset";
-    });
+    const bool hasPortabilitySubset = hasDeviceExtension(physicalDevice_, "VK_KHR_portability_subset");
     if (hasPortabilitySubset) extensions.push_back("VK_KHR_portability_subset");
     preferDeviceLocalHostVisible_ = !hasPortabilitySubset;
     segmentSimulationSubmits_ = hasPortabilitySubset;
