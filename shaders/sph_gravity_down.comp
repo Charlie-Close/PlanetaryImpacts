@@ -443,6 +443,7 @@ void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, flo
         int particle = tree[i];
         if (particle < 0 || particle >= pc.nParticles) continue;
         vec3 xi = positions[particle].xyz + 0.5 * curDt * velocities[particle].xyz;
+        float prevGrav = length(gravAccelerations[particle].xyz);
         vec3 acc = l2p(local, xi);
         for (int j = start; j < end; ++j) {
             if (i == j) continue;
@@ -460,7 +461,7 @@ void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, flo
             if (nodePointer < 0) break;
             int dataPointer = tree[nodePointer + 1];
             Multipole ump = multipoles[dataPointer];
-            if (m2pAccept(xi, 0.0, ump)) {
+            if (m2pAccept(xi, prevGrav, ump)) {
                 acc += m2p(ump, xi);
                 continue;
             }

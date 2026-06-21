@@ -197,8 +197,8 @@ int main(int argc, char** argv) {
             sph::VulkanSimulation gpuSimulation(simulator);
             std::cout << "Simulation Vulkan device: " << gpuSimulation.deviceName() << "\n";
             const bool quietSteps = std::getenv("SPH_QUIET_STEPS") != nullptr;
-            constexpr double fpsSmoothingAlpha = 0.05;
-            double smoothedFps = 0.0;
+            constexpr double frameTimeSmoothingAlpha = 0.05;
+            double smoothedLoopSeconds = 0.0;
             SnapshotFrameCounts videoFrameCounts{};
             if (options.snapshots) {
                 for (int snapshotter = 0; snapshotter < sph::params::nSnapshotters; ++snapshotter) {
@@ -246,7 +246,10 @@ int main(int argc, char** argv) {
                 const double simSeconds = simElapsed.count();
                 const double loopSeconds = loopElapsed.count();
                 const double fps = loopSeconds > 0.0 ? 1.0 / loopSeconds : 0.0;
-                smoothedFps = smoothedFps == 0.0 ? fps : (fpsSmoothingAlpha * fps + (1.0 - fpsSmoothingAlpha) * smoothedFps);
+                smoothedLoopSeconds = smoothedLoopSeconds == 0.0
+                    ? loopSeconds
+                    : (frameTimeSmoothingAlpha * loopSeconds + (1.0 - frameTimeSmoothingAlpha) * smoothedLoopSeconds);
+                const double smoothedFps = smoothedLoopSeconds > 0.0 ? 1.0 / smoothedLoopSeconds : 0.0;
                 if (!quietSteps) {
                     std::cout << "GPU step " << (i + 1) << "/" << options.steps
                               << " time=" << simulator.time() << "s"
