@@ -24,8 +24,29 @@ const int YYY = 16;
 const int YYZ = 17;
 const int YZZ = 18;
 const int ZZZ = 19;
+const int XXXX = 20;
+const int XXXY = 21;
+const int XXXZ = 22;
+const int XXYY = 23;
+const int XXYZ = 24;
+const int XXZZ = 25;
+const int XYYY = 26;
+const int XYYZ = 27;
+const int XYZZ = 28;
+const int XZZZ = 29;
+const int YYYY = 30;
+const int YYYZ = 31;
+const int YYZZ = 32;
+const int YZZZ = 33;
+const int ZZZZ = 34;
 
-const int binom3[4] = int[4](1, 3, 3, 1);
+const int binomialCoeffs[25] = int[25](
+    1, 0, 0, 0, 0,
+    1, 1, 0, 0, 0,
+    1, 2, 1, 0, 0,
+    1, 3, 3, 1, 0,
+    1, 4, 6, 4, 1
+);
 
 struct Multipole {
     vec4 pos;
@@ -33,7 +54,7 @@ struct Multipole {
     vec4 maxv;
     float size;
     float expansion[N_EXPANSION_TERMS];
-    float power[4];
+    float power[N_MULTIPOLE_POWERS];
     float minGrav;
     float eta;
     float pad0;
@@ -93,6 +114,10 @@ float integer_powf(float x, int n) {
     return pow(x, float(n));
 }
 
+int binomial(int p, int n) {
+    return binomialCoeffs[p * 5 + n];
+}
+
 float D_soft_1(float u) {
     float phi = -3.0 * u + 15.0;
     phi = phi * u - 28.0;
@@ -131,11 +156,19 @@ float D_soft_4(float u) {
     return phi;
 }
 
+float D_soft_5(float u) {
+    float phi = -315.0 * u;
+    phi = phi * u + 420.0;
+    phi = phi * u;
+    return phi;
+}
+
 Derivatives derivatives(vec3 vec, float eps) {
     float Dt1;
     float Dt2;
     float Dt3;
     float Dt4;
+    float Dt5;
     float r2 = dot(vec, vec);
     float r = sqrt(r2);
     float rInv = r > 1e-6 ? 1.0 / r : 0.0;
@@ -150,16 +183,26 @@ Derivatives derivatives(vec3 vec, float eps) {
         Dt3 = epsInv3 * D_soft_3(u);
         float epsInv4 = epsInv3 * epsInv;
         Dt4 = epsInv4 * D_soft_4(u);
+#if MULTIPOLE_EXPANSION_POWER > 3
+        float epsInv5 = epsInv4 * epsInv;
+        Dt5 = epsInv5 * D_soft_5(u);
+#endif
     } else {
         Dt1 = rInv;
         Dt2 = -Dt1 * rInv;
         Dt3 = -3.0 * Dt2 * rInv;
         Dt4 = -5.0 * Dt3 * rInv;
+#if MULTIPOLE_EXPANSION_POWER > 3
+        Dt5 = -7.0 * Dt4 * rInv;
+#endif
     }
 
     vec3 rr = vec * rInv;
     vec3 rr2 = rr * rr;
     vec3 rr3 = rr2 * rr;
+#if MULTIPOLE_EXPANSION_POWER > 3
+    vec3 rr4 = rr3 * rr;
+#endif
     Derivatives dev;
     for (int i = 0; i < N_EXPANSION_TERMS; ++i) dev.expansion[i] = 0.0;
     dev.expansion[M] = Dt1;
@@ -167,6 +210,7 @@ Derivatives derivatives(vec3 vec, float eps) {
     dev.expansion[Y] = rr.y * Dt2;
     dev.expansion[Z] = rr.z * Dt2;
 
+#if MULTIPOLE_EXPANSION_POWER > 1
     Dt2 *= rInv;
     dev.expansion[XX] = rr2.x * Dt3 + Dt2;
     dev.expansion[XY] = rr.x * rr.y * Dt3;
@@ -174,7 +218,9 @@ Derivatives derivatives(vec3 vec, float eps) {
     dev.expansion[YY] = rr2.y * Dt3 + Dt2;
     dev.expansion[YZ] = rr.y * rr.z * Dt3;
     dev.expansion[ZZ] = rr2.z * Dt3 + Dt2;
+#endif
 
+#if MULTIPOLE_EXPANSION_POWER > 2
     Dt3 *= rInv;
     dev.expansion[XXX] = rr3.x * Dt4 + 3.0 * rr.x * Dt3;
     dev.expansion[YYY] = rr3.y * Dt4 + 3.0 * rr.y * Dt3;
@@ -186,6 +232,26 @@ Derivatives derivatives(vec3 vec, float eps) {
     dev.expansion[XZZ] = rr2.z * rr.x * Dt4 + rr.x * Dt3;
     dev.expansion[YZZ] = rr2.z * rr.y * Dt4 + rr.y * Dt3;
     dev.expansion[XYZ] = rr.x * rr.y * rr.z * Dt4;
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 3
+    Dt3 *= rInv;
+    Dt4 *= rInv;
+    dev.expansion[XXXX] = rr4.x * Dt5 + 6.0 * rr2.x * Dt4 + 3.0 * Dt3;
+    dev.expansion[YYYY] = rr4.y * Dt5 + 6.0 * rr2.y * Dt4 + 3.0 * Dt3;
+    dev.expansion[ZZZZ] = rr4.z * Dt5 + 6.0 * rr2.z * Dt4 + 3.0 * Dt3;
+    dev.expansion[XXXY] = rr3.x * rr.y * Dt5 + 3.0 * rr.x * rr.y * Dt4;
+    dev.expansion[XXXZ] = rr3.x * rr.z * Dt5 + 3.0 * rr.x * rr.z * Dt4;
+    dev.expansion[XYYY] = rr3.y * rr.x * Dt5 + 3.0 * rr.y * rr.x * Dt4;
+    dev.expansion[YYYZ] = rr3.y * rr.z * Dt5 + 3.0 * rr.y * rr.z * Dt4;
+    dev.expansion[XZZZ] = rr3.z * rr.x * Dt5 + 3.0 * rr.z * rr.x * Dt4;
+    dev.expansion[YZZZ] = rr3.z * rr.y * Dt5 + 3.0 * rr.z * rr.y * Dt4;
+    dev.expansion[XXYY] = rr2.x * rr2.y * Dt5 + rr2.x * Dt4 + rr2.y * Dt4 + Dt3;
+    dev.expansion[XXZZ] = rr2.x * rr2.z * Dt5 + rr2.x * Dt4 + rr2.z * Dt4 + Dt3;
+    dev.expansion[YYZZ] = rr2.y * rr2.z * Dt5 + rr2.y * Dt4 + rr2.z * Dt4 + Dt3;
+    dev.expansion[XXYZ] = rr2.x * rr.y * rr.z * Dt5 + rr.y * rr.z * Dt4;
+    dev.expansion[XYYZ] = rr2.y * rr.x * rr.z * Dt5 + rr.x * rr.z * Dt4;
+    dev.expansion[XYZZ] = rr2.z * rr.x * rr.y * Dt5 + rr.x * rr.y * Dt4;
+#endif
     return dev;
 }
 
@@ -215,11 +281,12 @@ bool m2lAccept(Multipole A, Multipole B) {
     float rhoSum = rhoA + rhoB;
     if (rhoSum * rhoSum > r2) return false;
     float rhoMax = max(rhoA, rhoB);
+    const int p = MULTIPOLE_EXPANSION_POWER;
     float e = 0.0;
-    for (int n = 0; n <= 3; ++n) e += float(binom3[n]) * B.power[n] * integer_powf(rhoA, 3 - n);
+    for (int n = 0; n <= p; ++n) e += float(binomial(p, n)) * B.power[n] * integer_powf(rhoA, p - n);
     e *= 8.0 * rhoMax;
     e /= rhoSum;
-    float rToP = integer_powf(r2, 1);
+    float rToP = integer_powf(r2, p / 2);
     return e < GRAVITY_ETA * A.minGrav * rToP * r2;
 }
 
@@ -228,8 +295,9 @@ bool m2pAccept(vec3 x, float prevGrav, Multipole B) {
     if (rhoB < 1e-12) return true;
     float r2 = dot(x - B.pos.xyz, x - B.pos.xyz);
     if (rhoB * rhoB > r2) return false;
-    float e = 8.0 * B.power[3];
-    float rToP = integer_powf(r2, 1);
+    const int p = MULTIPOLE_EXPANSION_POWER;
+    float e = 8.0 * float(binomial(p, p)) * B.power[p];
+    float rToP = integer_powf(r2, p / 2);
     return e < GRAVITY_ETA * prevGrav * rToP * r2;
 }
 
@@ -242,6 +310,7 @@ void m2l(Multipole mp, inout Local local) {
     local.expansion[Y] += M000 * d.expansion[Y];
     local.expansion[Z] += M000 * d.expansion[Z];
 
+#if MULTIPOLE_EXPANSION_POWER > 1
     float M200 = mp.expansion[XX], M020 = mp.expansion[YY], M002 = mp.expansion[ZZ];
     float M110 = mp.expansion[XY], M101 = mp.expansion[XZ], M011 = mp.expansion[YZ];
     local.expansion[M] += M200 * d.expansion[XX] + M020 * d.expansion[YY] + M002 * d.expansion[ZZ];
@@ -252,7 +321,9 @@ void m2l(Multipole mp, inout Local local) {
     local.expansion[XY] += M000 * d.expansion[XY];
     local.expansion[XZ] += M000 * d.expansion[XZ];
     local.expansion[YZ] += M000 * d.expansion[YZ];
+#endif
 
+#if MULTIPOLE_EXPANSION_POWER > 2
     float M300 = mp.expansion[XXX], M030 = mp.expansion[YYY], M003 = mp.expansion[ZZZ];
     float M210 = mp.expansion[XXY], M201 = mp.expansion[XXZ], M021 = mp.expansion[YYZ];
     float M120 = mp.expansion[XYY], M012 = mp.expansion[YZZ], M102 = mp.expansion[XZZ], M111 = mp.expansion[XYZ];
@@ -275,20 +346,109 @@ void m2l(Multipole mp, inout Local local) {
     local.expansion[XZZ] += M000 * d.expansion[XZZ];
     local.expansion[YZZ] += M000 * d.expansion[YZZ];
     local.expansion[XYZ] += M000 * d.expansion[XYZ];
+#endif
+
+#if MULTIPOLE_EXPANSION_POWER > 3
+    float M400 = mp.expansion[XXXX], M040 = mp.expansion[YYYY], M004 = mp.expansion[ZZZZ];
+    float M310 = mp.expansion[XXXY], M301 = mp.expansion[XXXZ], M031 = mp.expansion[YYYZ];
+    float M130 = mp.expansion[XYYY], M013 = mp.expansion[YZZZ], M103 = mp.expansion[XZZZ];
+    float M220 = mp.expansion[XXYY], M202 = mp.expansion[XXZZ], M022 = mp.expansion[YYZZ];
+    float M211 = mp.expansion[XXYZ], M121 = mp.expansion[XYYZ], M112 = mp.expansion[XYZZ];
+
+    float D400 = d.expansion[XXXX], D040 = d.expansion[YYYY], D004 = d.expansion[ZZZZ];
+    float D310 = d.expansion[XXXY], D301 = d.expansion[XXXZ], D031 = d.expansion[YYYZ];
+    float D130 = d.expansion[XYYY], D013 = d.expansion[YZZZ], D103 = d.expansion[XZZZ];
+    float D220 = d.expansion[XXYY], D202 = d.expansion[XXZZ], D022 = d.expansion[YYZZ];
+    float D211 = d.expansion[XXYZ], D121 = d.expansion[XYYZ], D112 = d.expansion[XYZZ];
+
+    local.expansion[M] += M004 * D004 + M013 * D013 + M022 * D022 + M031 * D031;
+    local.expansion[M] += M040 * D040 + M103 * D103 + M112 * D112 + M121 * D121;
+    local.expansion[M] += M130 * D130 + M202 * D202 + M211 * D211 + M220 * D220;
+    local.expansion[M] += M301 * D301 + M310 * D310 + M400 * D400;
+
+    local.expansion[Z] += M003 * D004 + M012 * D013 + M021 * D022 + M030 * D031;
+    local.expansion[Z] += M102 * D103 + M111 * D112 + M120 * D121 + M201 * D202;
+    local.expansion[Z] += M210 * D211 + M300 * D301;
+    local.expansion[Y] += M003 * D013 + M012 * D022 + M021 * D031 + M030 * D040;
+    local.expansion[Y] += M102 * D112 + M111 * D121 + M120 * D130 + M201 * D211;
+    local.expansion[Y] += M210 * D220 + M300 * D310;
+    local.expansion[X] += M003 * D103 + M012 * D112 + M021 * D121 + M030 * D130;
+    local.expansion[X] += M102 * D202 + M111 * D211 + M120 * D220 + M201 * D301;
+    local.expansion[X] += M210 * D310 + M300 * D400;
+
+    local.expansion[ZZ] += M002 * D004 + M011 * D013 + M020 * D022 + M101 * D103 + M110 * D112 + M200 * D202;
+    local.expansion[YZ] += M002 * D013 + M011 * D022 + M020 * D031 + M101 * D112 + M110 * D121 + M200 * D211;
+    local.expansion[YY] += M002 * D022 + M011 * D031 + M020 * D040 + M101 * D121 + M110 * D130 + M200 * D220;
+    local.expansion[XZ] += M002 * D103 + M011 * D112 + M020 * D121 + M101 * D202 + M110 * D211 + M200 * D301;
+    local.expansion[XY] += M002 * D112 + M011 * D121 + M020 * D130 + M101 * D211 + M110 * D220 + M200 * D310;
+    local.expansion[XX] += M002 * D202 + M011 * D211 + M020 * D220 + M101 * D301 + M110 * D310 + M200 * D400;
+
+    local.expansion[ZZZZ] += M000 * D004;
+    local.expansion[YZZZ] += M000 * D013;
+    local.expansion[YYZZ] += M000 * D022;
+    local.expansion[YYYZ] += M000 * D031;
+    local.expansion[YYYY] += M000 * D040;
+    local.expansion[XZZZ] += M000 * D103;
+    local.expansion[XYZZ] += M000 * D112;
+    local.expansion[XYYZ] += M000 * D121;
+    local.expansion[XYYY] += M000 * D130;
+    local.expansion[XXZZ] += M000 * D202;
+    local.expansion[XXYZ] += M000 * D211;
+    local.expansion[XXYY] += M000 * D220;
+    local.expansion[XXXZ] += M000 * D301;
+    local.expansion[XXXY] += M000 * D310;
+    local.expansion[XXXX] += M000 * D400;
+#endif
 }
 
 vec3 l2p(Local local, vec3 pos) {
     vec3 r = pos - local.pos.xyz;
     vec3 acc = vec3(local.expansion[X], local.expansion[Y], local.expansion[Z]);
+#if MULTIPOLE_EXPANSION_POWER > 1
     acc.x += r.x * local.expansion[XX] + r.y * local.expansion[XY] + r.z * local.expansion[XZ];
     acc.y += r.x * local.expansion[XY] + r.y * local.expansion[YY] + r.z * local.expansion[YZ];
     acc.z += r.x * local.expansion[XZ] + r.y * local.expansion[YZ] + r.z * local.expansion[ZZ];
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 2
     acc.x += 0.5 * r.x * r.x * local.expansion[XXX] + 0.5 * r.y * r.y * local.expansion[XYY] + 0.5 * r.z * r.z * local.expansion[XZZ];
     acc.x += r.x * r.y * local.expansion[XXY] + r.x * r.z * local.expansion[XXZ] + r.y * r.z * local.expansion[XYZ];
     acc.y += 0.5 * r.x * r.x * local.expansion[XXY] + 0.5 * r.y * r.y * local.expansion[YYY] + 0.5 * r.z * r.z * local.expansion[YZZ];
     acc.y += r.x * r.y * local.expansion[XYY] + r.x * r.z * local.expansion[XYZ] + r.y * r.z * local.expansion[YYZ];
     acc.z += 0.5 * r.x * r.x * local.expansion[XXZ] + 0.5 * r.y * r.y * local.expansion[YYZ] + 0.5 * r.z * r.z * local.expansion[ZZZ];
     acc.z += r.x * r.y * local.expansion[XYZ] + r.x * r.z * local.expansion[XZZ] + r.y * r.z * local.expansion[YZZ];
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 3
+    acc.x += 0.1666666666666667 * r.z * r.z * r.z * local.expansion[XZZZ] +
+             0.5 * r.y * r.z * r.z * local.expansion[XYZZ] +
+             0.5 * r.y * r.y * r.z * local.expansion[XYYZ] +
+             0.1666666666666667 * r.y * r.y * r.y * local.expansion[XYYY] +
+             0.5 * r.x * r.z * r.z * local.expansion[XXZZ] +
+             r.x * r.y * r.z * local.expansion[XXYZ] +
+             0.5 * r.x * r.y * r.y * local.expansion[XXYY] +
+             0.5 * r.x * r.x * r.z * local.expansion[XXXZ] +
+             0.5 * r.x * r.x * r.y * local.expansion[XXXY] +
+             0.1666666666666667 * r.x * r.x * r.x * local.expansion[XXXX];
+    acc.y += 0.1666666666666667 * r.z * r.z * r.z * local.expansion[YZZZ] +
+             0.5 * r.y * r.z * r.z * local.expansion[YYZZ] +
+             0.5 * r.y * r.y * r.z * local.expansion[YYYZ] +
+             0.1666666666666667 * r.y * r.y * r.y * local.expansion[YYYY] +
+             0.5 * r.x * r.z * r.z * local.expansion[XYZZ] +
+             r.x * r.y * r.z * local.expansion[XYYZ] +
+             0.5 * r.x * r.y * r.y * local.expansion[XYYY] +
+             0.5 * r.x * r.x * r.z * local.expansion[XXYZ] +
+             0.5 * r.x * r.x * r.y * local.expansion[XXYY] +
+             0.1666666666666667 * r.x * r.x * r.x * local.expansion[XXXY];
+    acc.z += 0.1666666666666667 * r.z * r.z * r.z * local.expansion[ZZZZ] +
+             0.5 * r.y * r.z * r.z * local.expansion[YZZZ] +
+             0.5 * r.y * r.y * r.z * local.expansion[YYZZ] +
+             0.1666666666666667 * r.y * r.y * r.y * local.expansion[YYYZ] +
+             0.5 * r.x * r.z * r.z * local.expansion[XZZZ] +
+             r.x * r.y * r.z * local.expansion[XYZZ] +
+             0.5 * r.x * r.y * r.y * local.expansion[XYYZ] +
+             0.5 * r.x * r.x * r.z * local.expansion[XXZZ] +
+             0.5 * r.x * r.x * r.y * local.expansion[XXYZ] +
+             0.1666666666666667 * r.x * r.x * r.x * local.expansion[XXXZ];
+#endif
     return acc;
 }
 
@@ -304,14 +464,17 @@ Local transformLocal(Local local, vec3 r) {
     Local outLocal = local;
     outLocal.pos = vec4(local.pos.xyz + r, 0.0);
     float x = r.x, y = r.y, z = r.z;
-    float x2 = x * x, y2 = y * y, z2 = z * z;
     outLocal.expansion[M] += x * local.expansion[X] + y * local.expansion[Y] + z * local.expansion[Z];
+#if MULTIPOLE_EXPANSION_POWER > 1
+    float x2 = x * x, y2 = y * y, z2 = z * z;
     outLocal.expansion[M] += 0.5 * x2 * local.expansion[XX] + 0.5 * y2 * local.expansion[YY] + 0.5 * z2 * local.expansion[ZZ];
     outLocal.expansion[M] += x * y * local.expansion[XY] + x * z * local.expansion[XZ] + y * z * local.expansion[YZ];
     outLocal.expansion[X] += x * local.expansion[XX] + y * local.expansion[XY] + z * local.expansion[XZ];
     outLocal.expansion[Y] += x * local.expansion[XY] + y * local.expansion[YY] + z * local.expansion[YZ];
     outLocal.expansion[Z] += x * local.expansion[XZ] + y * local.expansion[YZ] + z * local.expansion[ZZ];
+#endif
 
+#if MULTIPOLE_EXPANSION_POWER > 2
     float x3 = x2 * x, y3 = y2 * y, z3 = z2 * z;
     outLocal.expansion[M] += (x3 / 6.0) * local.expansion[XXX] + (y3 / 6.0) * local.expansion[YYY] + (z3 / 6.0) * local.expansion[ZZZ];
     outLocal.expansion[M] += 0.5 * x2 * y * local.expansion[XXY] + 0.5 * x2 * z * local.expansion[XXZ] + 0.5 * x * y2 * local.expansion[XYY];
@@ -329,6 +492,128 @@ Local transformLocal(Local local, vec3 r) {
     outLocal.expansion[XY] += x * local.expansion[XXY] + y * local.expansion[XYY] + z * local.expansion[XYZ];
     outLocal.expansion[XZ] += x * local.expansion[XXZ] + y * local.expansion[XYZ] + z * local.expansion[XZZ];
     outLocal.expansion[YZ] += x * local.expansion[XYZ] + y * local.expansion[YYZ] + z * local.expansion[YZZ];
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 3
+    float R400 = x * x3;
+    float R040 = y * y3;
+    float R004 = z * z3;
+    float R310 = x3 * y;
+    float R301 = x3 * z;
+    float R130 = x * y3;
+    float R031 = y3 * z;
+    float R103 = x * z3;
+    float R013 = y * z3;
+    float R220 = x2 * y2;
+    float R202 = x2 * z2;
+    float R022 = y2 * z2;
+    float R211 = x2 * y * z;
+    float R121 = x * y2 * z;
+    float R112 = x * y * z2;
+
+    float X400 = 0.041666666666666667 * R400;
+    float X040 = 0.041666666666666667 * R040;
+    float X004 = 0.041666666666666667 * R004;
+    float X310 = 0.1666666666666667 * R310;
+    float X301 = 0.1666666666666667 * R301;
+    float X130 = 0.1666666666666667 * R130;
+    float X031 = 0.1666666666666667 * R031;
+    float X103 = 0.1666666666666667 * R103;
+    float X013 = 0.1666666666666667 * R013;
+    float X220 = 0.25 * R220;
+    float X202 = 0.25 * R202;
+    float X022 = 0.25 * R022;
+    float X211 = 0.5 * R211;
+    float X121 = 0.5 * R121;
+    float X112 = 0.5 * R112;
+
+    outLocal.expansion[M] += X004 * local.expansion[ZZZZ] + X013 * local.expansion[YZZZ] +
+        X022 * local.expansion[YYZZ] + X031 * local.expansion[YYYZ] +
+        X040 * local.expansion[YYYY] + X103 * local.expansion[XZZZ] +
+        X112 * local.expansion[XYZZ] + X121 * local.expansion[XYYZ] +
+        X130 * local.expansion[XYYY] + X202 * local.expansion[XXZZ] +
+        X211 * local.expansion[XXYZ] + X220 * local.expansion[XXYY] +
+        X301 * local.expansion[XXXZ] + X310 * local.expansion[XXXY] +
+        X400 * local.expansion[XXXX];
+
+    outLocal.expansion[Z] += (z3 / 6.0) * local.expansion[ZZZZ] +
+        0.5 * y * z2 * local.expansion[YZZZ] +
+        0.5 * y2 * z * local.expansion[YYZZ] +
+        (y3 / 6.0) * local.expansion[YYYZ] +
+        0.5 * x * z2 * local.expansion[XZZZ] +
+        x * y * z * local.expansion[XYZZ] +
+        0.5 * x * y2 * local.expansion[XYYZ] +
+        0.5 * x2 * z * local.expansion[XXZZ] +
+        0.5 * x2 * y * local.expansion[XXYZ] +
+        (x3 / 6.0) * local.expansion[XXXZ];
+    outLocal.expansion[Y] += (z3 / 6.0) * local.expansion[YZZZ] +
+        0.5 * y * z2 * local.expansion[YYZZ] +
+        0.5 * y2 * z * local.expansion[YYYZ] +
+        (y3 / 6.0) * local.expansion[YYYY] +
+        0.5 * x * z2 * local.expansion[XYZZ] +
+        x * y * z * local.expansion[XYYZ] +
+        0.5 * x * y2 * local.expansion[XYYY] +
+        0.5 * x2 * z * local.expansion[XXYZ] +
+        0.5 * x2 * y * local.expansion[XXYY] +
+        (x3 / 6.0) * local.expansion[XXXY];
+    outLocal.expansion[X] += (z3 / 6.0) * local.expansion[XZZZ] +
+        0.5 * y * z2 * local.expansion[XYZZ] +
+        0.5 * y2 * z * local.expansion[XYYZ] +
+        (y3 / 6.0) * local.expansion[XYYY] +
+        0.5 * x * z2 * local.expansion[XXZZ] +
+        x * y * z * local.expansion[XXYZ] +
+        0.5 * x * y2 * local.expansion[XXYY] +
+        0.5 * x2 * z * local.expansion[XXXZ] +
+        0.5 * x2 * y * local.expansion[XXXY] +
+        (x3 / 6.0) * local.expansion[XXXX];
+
+    outLocal.expansion[ZZ] += 0.5 * z2 * local.expansion[ZZZZ] +
+        y * z * local.expansion[YZZZ] +
+        0.5 * y2 * local.expansion[YYZZ] +
+        x * z * local.expansion[XZZZ] +
+        x * y * local.expansion[XYZZ] +
+        0.5 * x2 * local.expansion[XXZZ];
+    outLocal.expansion[YZ] += 0.5 * z2 * local.expansion[YZZZ] +
+        y * z * local.expansion[YYZZ] +
+        0.5 * y2 * local.expansion[YYYZ] +
+        x * z * local.expansion[XYZZ] +
+        x * y * local.expansion[XYYZ] +
+        0.5 * x2 * local.expansion[XXYZ];
+    outLocal.expansion[YY] += 0.5 * z2 * local.expansion[YYZZ] +
+        y * z * local.expansion[YYYZ] +
+        0.5 * y2 * local.expansion[YYYY] +
+        x * z * local.expansion[XYYZ] +
+        x * y * local.expansion[XYYY] +
+        0.5 * x2 * local.expansion[XXYY];
+    outLocal.expansion[XZ] += 0.5 * z2 * local.expansion[XZZZ] +
+        y * z * local.expansion[XYZZ] +
+        0.5 * y2 * local.expansion[XYYZ] +
+        x * z * local.expansion[XXZZ] +
+        x * y * local.expansion[XXYZ] +
+        0.5 * x2 * local.expansion[XXXZ];
+    outLocal.expansion[XY] += 0.5 * z2 * local.expansion[XYZZ] +
+        y * z * local.expansion[XYYZ] +
+        0.5 * y2 * local.expansion[XYYY] +
+        x * z * local.expansion[XXYZ] +
+        x * y * local.expansion[XXYY] +
+        0.5 * x2 * local.expansion[XXXY];
+    outLocal.expansion[XX] += 0.5 * z2 * local.expansion[XXZZ] +
+        y * z * local.expansion[XXYZ] +
+        0.5 * y2 * local.expansion[XXYY] +
+        x * z * local.expansion[XXXZ] +
+        x * y * local.expansion[XXXY] +
+        0.5 * x2 * local.expansion[XXXX];
+
+    outLocal.expansion[ZZZ] += z * local.expansion[ZZZZ] + y * local.expansion[YZZZ] + x * local.expansion[XZZZ];
+    outLocal.expansion[YZZ] += z * local.expansion[YZZZ] + y * local.expansion[YYZZ] + x * local.expansion[XYZZ];
+    outLocal.expansion[YYZ] += z * local.expansion[YYZZ] + y * local.expansion[YYYZ] + x * local.expansion[XYYZ];
+    outLocal.expansion[YYY] += z * local.expansion[YYYZ] + y * local.expansion[YYYY] + x * local.expansion[XYYY];
+    outLocal.expansion[XZZ] += z * local.expansion[XZZZ] + y * local.expansion[XYZZ] + x * local.expansion[XXZZ];
+    outLocal.expansion[XYZ] += z * local.expansion[XYZZ] + y * local.expansion[XYYZ] + x * local.expansion[XXYZ];
+    outLocal.expansion[XYY] += z * local.expansion[XYYZ] + y * local.expansion[XYYY] + x * local.expansion[XXYY];
+    outLocal.expansion[XXZ] += z * local.expansion[XXZZ] + y * local.expansion[XXYZ] + x * local.expansion[XXXZ];
+    outLocal.expansion[XXY] += z * local.expansion[XXYZ] + y * local.expansion[XXYY] + x * local.expansion[XXXY];
+    outLocal.expansion[XXX] += z * local.expansion[XXXZ] + y * local.expansion[XXXY] + x * local.expansion[XXXX];
+#endif
     return outLocal;
 }
 

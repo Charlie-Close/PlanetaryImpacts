@@ -24,6 +24,21 @@ const int YYY = 16;
 const int YYZ = 17;
 const int YZZ = 18;
 const int ZZZ = 19;
+const int XXXX = 20;
+const int XXXY = 21;
+const int XXXZ = 22;
+const int XXYY = 23;
+const int XXYZ = 24;
+const int XXZZ = 25;
+const int XYYY = 26;
+const int XYYZ = 27;
+const int XYZZ = 28;
+const int XZZZ = 29;
+const int YYYY = 30;
+const int YYYZ = 31;
+const int YYZZ = 32;
+const int YZZZ = 33;
+const int ZZZZ = 34;
 
 struct Multipole {
     vec4 pos;
@@ -31,7 +46,7 @@ struct Multipole {
     vec4 maxv;
     float size;
     float expansion[N_EXPANSION_TERMS];
-    float power[4];
+    float power[N_MULTIPOLE_POWERS];
     float minGrav;
     float eta;
     float pad0;
@@ -79,7 +94,7 @@ void clearMultipole(int dataPointer) {
     multipoles[dataPointer].maxv = vec4(-MAX_FLOAT);
     multipoles[dataPointer].size = 0.0;
     for (int i = 0; i < N_EXPANSION_TERMS; ++i) multipoles[dataPointer].expansion[i] = 0.0;
-    for (int i = 0; i < 4; ++i) multipoles[dataPointer].power[i] = 0.0;
+    for (int i = 0; i < N_MULTIPOLE_POWERS; ++i) multipoles[dataPointer].power[i] = 0.0;
     multipoles[dataPointer].minGrav = MAX_FLOAT;
     multipoles[dataPointer].eta = 0.0;
     multipoles[dataPointer].pad0 = 0.0;
@@ -90,6 +105,7 @@ void addPowers(int dataPointer) {
     Multipole mp = multipoles[dataPointer];
     multipoles[dataPointer].power[0] = mp.expansion[M];
     multipoles[dataPointer].power[1] = 0.0;
+#if MULTIPOLE_EXPANSION_POWER > 1
     float p2 = mp.expansion[ZZ] * mp.expansion[ZZ];
     p2 += 0.5 * mp.expansion[YZ] * mp.expansion[YZ];
     p2 += mp.expansion[YY] * mp.expansion[YY];
@@ -97,7 +113,9 @@ void addPowers(int dataPointer) {
     p2 += 0.5 * mp.expansion[XY] * mp.expansion[XY];
     p2 += 0.5 * mp.expansion[XX] * mp.expansion[XX];
     multipoles[dataPointer].power[2] = sqrt(max(p2, 0.0));
+#endif
 
+#if MULTIPOLE_EXPANSION_POWER > 2
     float p3 = mp.expansion[ZZZ] * mp.expansion[ZZZ];
     p3 += (1.0 / 3.0) * mp.expansion[YZZ] * mp.expansion[YZZ];
     p3 += (1.0 / 3.0) * mp.expansion[YYZ] * mp.expansion[YYZ];
@@ -109,6 +127,26 @@ void addPowers(int dataPointer) {
     p3 += (1.0 / 3.0) * mp.expansion[XXY] * mp.expansion[XXY];
     p3 = mp.expansion[XXX] * mp.expansion[XXX];
     multipoles[dataPointer].power[3] = sqrt(max(p3, 0.0));
+#endif
+
+#if MULTIPOLE_EXPANSION_POWER > 3
+    float p4 = mp.expansion[ZZZZ] * mp.expansion[ZZZZ];
+    p4 += 0.25 * mp.expansion[YZZZ] * mp.expansion[YZZZ];
+    p4 += 0.1666666666666667 * mp.expansion[YYZZ] * mp.expansion[YYZZ];
+    p4 += 0.25 * mp.expansion[YYYZ] * mp.expansion[YYYZ];
+    p4 += mp.expansion[YYYY] * mp.expansion[YYYY];
+    p4 += 0.25 * mp.expansion[XZZZ] * mp.expansion[XZZZ];
+    p4 += 0.08333333333333333 * mp.expansion[XYZZ] * mp.expansion[XYZZ];
+    p4 += 0.08333333333333333 * mp.expansion[XYYZ] * mp.expansion[XYYZ];
+    p4 += 0.25 * mp.expansion[XYYY] * mp.expansion[XYYY];
+    p4 += 0.1666666666666667 * mp.expansion[XXZZ] * mp.expansion[XXZZ];
+    p4 += 0.08333333333333333 * mp.expansion[XXYZ] * mp.expansion[XXYZ];
+    p4 += 0.1666666666666667 * mp.expansion[XXYY] * mp.expansion[XXYY];
+    p4 += 0.25 * mp.expansion[XXXZ] * mp.expansion[XXXZ];
+    p4 += 0.25 * mp.expansion[XXXY] * mp.expansion[XXXY];
+    p4 += mp.expansion[XXXX] * mp.expansion[XXXX];
+    multipoles[dataPointer].power[4] = sqrt(max(p4, 0.0));
+#endif
 }
 
 void accumulateP2M(int treePointer, int dataPointer, float fdt) {
@@ -144,13 +182,16 @@ void accumulateP2M(int treePointer, int dataPointer, float fdt) {
         multipoles[dataPointer].expansion[Y] -= r.y * pmass;
         multipoles[dataPointer].expansion[Z] -= r.z * pmass;
 
+#if MULTIPOLE_EXPANSION_POWER > 1
         multipoles[dataPointer].expansion[XX] += pmass * r.x * r.x;
         multipoles[dataPointer].expansion[XY] += pmass * r.x * r.y;
         multipoles[dataPointer].expansion[XZ] += pmass * r.x * r.z;
         multipoles[dataPointer].expansion[YY] += pmass * r.y * r.y;
         multipoles[dataPointer].expansion[YZ] += pmass * r.y * r.z;
         multipoles[dataPointer].expansion[ZZ] += pmass * r.z * r.z;
+#endif
 
+#if MULTIPOLE_EXPANSION_POWER > 2
         multipoles[dataPointer].expansion[XXX] -= pmass * r.x * r.x * r.x;
         multipoles[dataPointer].expansion[XXY] -= pmass * r.x * r.x * r.y;
         multipoles[dataPointer].expansion[XXZ] -= pmass * r.x * r.x * r.z;
@@ -161,11 +202,33 @@ void accumulateP2M(int treePointer, int dataPointer, float fdt) {
         multipoles[dataPointer].expansion[YYZ] -= pmass * r.y * r.y * r.z;
         multipoles[dataPointer].expansion[YZZ] -= pmass * r.y * r.z * r.z;
         multipoles[dataPointer].expansion[ZZZ] -= pmass * r.z * r.z * r.z;
+#endif
+
+#if MULTIPOLE_EXPANSION_POWER > 3
+        multipoles[dataPointer].expansion[XXXX] += pmass * r.x * r.x * r.x * r.x;
+        multipoles[dataPointer].expansion[XXXY] += pmass * r.x * r.x * r.x * r.y;
+        multipoles[dataPointer].expansion[XXXZ] += pmass * r.x * r.x * r.x * r.z;
+        multipoles[dataPointer].expansion[XXYY] += pmass * r.x * r.x * r.y * r.y;
+        multipoles[dataPointer].expansion[XXYZ] += pmass * r.x * r.x * r.y * r.z;
+        multipoles[dataPointer].expansion[XXZZ] += pmass * r.x * r.x * r.z * r.z;
+        multipoles[dataPointer].expansion[XYYY] += pmass * r.x * r.y * r.y * r.y;
+        multipoles[dataPointer].expansion[XYYZ] += pmass * r.x * r.y * r.y * r.z;
+        multipoles[dataPointer].expansion[XYZZ] += pmass * r.x * r.y * r.z * r.z;
+        multipoles[dataPointer].expansion[XZZZ] += pmass * r.x * r.z * r.z * r.z;
+        multipoles[dataPointer].expansion[YYYY] += pmass * r.y * r.y * r.y * r.y;
+        multipoles[dataPointer].expansion[YYYZ] += pmass * r.y * r.y * r.y * r.z;
+        multipoles[dataPointer].expansion[YYZZ] += pmass * r.y * r.y * r.z * r.z;
+        multipoles[dataPointer].expansion[YZZZ] += pmass * r.y * r.z * r.z * r.z;
+        multipoles[dataPointer].expansion[ZZZZ] += pmass * r.z * r.z * r.z * r.z;
+#endif
     }
 
+#if MULTIPOLE_EXPANSION_POWER > 1
     multipoles[dataPointer].expansion[XX] *= 0.5;
     multipoles[dataPointer].expansion[YY] *= 0.5;
     multipoles[dataPointer].expansion[ZZ] *= 0.5;
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 2
     multipoles[dataPointer].expansion[XXX] *= 0.1666666666666667;
     multipoles[dataPointer].expansion[YYY] *= 0.1666666666666667;
     multipoles[dataPointer].expansion[ZZZ] *= 0.1666666666666667;
@@ -175,17 +238,38 @@ void accumulateP2M(int treePointer, int dataPointer, float fdt) {
     multipoles[dataPointer].expansion[XZZ] *= 0.5;
     multipoles[dataPointer].expansion[YYZ] *= 0.5;
     multipoles[dataPointer].expansion[YZZ] *= 0.5;
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 3
+    multipoles[dataPointer].expansion[XXXX] *= 0.041666666666666667;
+    multipoles[dataPointer].expansion[YYYY] *= 0.041666666666666667;
+    multipoles[dataPointer].expansion[ZZZZ] *= 0.041666666666666667;
+    multipoles[dataPointer].expansion[XXXY] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[XXXZ] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[XYYY] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[XZZZ] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[YYYZ] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[YZZZ] *= 0.1666666666666667;
+    multipoles[dataPointer].expansion[XXYY] *= 0.25;
+    multipoles[dataPointer].expansion[XXZZ] *= 0.25;
+    multipoles[dataPointer].expansion[YYZZ] *= 0.25;
+    multipoles[dataPointer].expansion[XXYZ] *= 0.5;
+    multipoles[dataPointer].expansion[XYYZ] *= 0.5;
+    multipoles[dataPointer].expansion[XYZZ] *= 0.5;
+#endif
 }
 
 float transformedExpansion(Multipole mp, vec3 r, int term) {
     if (term == M) return mp.expansion[M];
     if (term == X || term == Y || term == Z) return 0.0;
+#if MULTIPOLE_EXPANSION_POWER > 1
     if (term == XX) return mp.expansion[XX] + 0.5 * r.x * r.x * mp.expansion[M];
     if (term == XY) return mp.expansion[XY] + r.x * r.y * mp.expansion[M];
     if (term == XZ) return mp.expansion[XZ] + r.x * r.z * mp.expansion[M];
     if (term == YY) return mp.expansion[YY] + 0.5 * r.y * r.y * mp.expansion[M];
     if (term == YZ) return mp.expansion[YZ] + r.y * r.z * mp.expansion[M];
     if (term == ZZ) return mp.expansion[ZZ] + 0.5 * r.z * r.z * mp.expansion[Z];
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 2
     if (term == ZZZ) return mp.expansion[ZZZ] + r.z * mp.expansion[ZZ] + 0.166666666667 * r.z * r.z * r.z * mp.expansion[M];
     if (term == YZZ) return mp.expansion[YZZ] + r.z * mp.expansion[YZ] + r.y * mp.expansion[ZZ] + 0.5 * r.y * r.z * r.z * mp.expansion[M];
     if (term == YYZ) return mp.expansion[YYZ] + r.z * mp.expansion[YY] + r.y * mp.expansion[YZ] + 0.5 * r.y * r.y * r.z * mp.expansion[M];
@@ -196,6 +280,90 @@ float transformedExpansion(Multipole mp, vec3 r, int term) {
     if (term == XXZ) return mp.expansion[XXZ] + r.z * mp.expansion[XX] + r.x * mp.expansion[XZ] + 0.5 * r.x * r.x * r.z * mp.expansion[M];
     if (term == XXY) return mp.expansion[XXY] + r.y * mp.expansion[XX] + r.x * mp.expansion[XY] + 0.5 * r.x * r.x * r.y * mp.expansion[M];
     if (term == XXX) return mp.expansion[XXX] + r.x * mp.expansion[XX] + 0.1666666667 * r.x * r.x * r.x * mp.expansion[M];
+#endif
+#if MULTIPOLE_EXPANSION_POWER > 3
+    if (term == ZZZZ) return mp.expansion[ZZZZ] + r.z * mp.expansion[ZZZ] +
+        0.5 * r.z * r.z * mp.expansion[ZZ] +
+        0.041666666666666667 * r.z * r.z * r.z * r.z * mp.expansion[M];
+    if (term == YZZZ) return mp.expansion[YZZZ] + r.z * mp.expansion[YZZ] +
+        0.5 * r.z * r.z * mp.expansion[YZ] +
+        r.y * mp.expansion[ZZZ] +
+        r.y * r.z * mp.expansion[ZZ] +
+        0.1666666666666667 * r.y * r.z * r.z * r.z * mp.expansion[M];
+    if (term == YYZZ) return mp.expansion[YYZZ] + r.z * mp.expansion[YYZ] +
+        0.5 * r.z * r.z * mp.expansion[YY] +
+        r.y * mp.expansion[YZZ] +
+        r.y * r.z * mp.expansion[YZ] +
+        0.5 * r.y * r.y * mp.expansion[ZZ] +
+        0.25 * r.y * r.y * r.z * r.z * mp.expansion[M];
+    if (term == YYYZ) return mp.expansion[YYZ] + r.z * mp.expansion[YYY] +
+        r.y * mp.expansion[YYZ] +
+        r.y * r.z * mp.expansion[YY] +
+        0.5 * r.y * r.y * mp.expansion[YZ] +
+        0.1666666666666667 * r.y * r.y * r.y * r.z * mp.expansion[M];
+    if (term == YYYY) return mp.expansion[YYYY] + r.y * mp.expansion[YYY] +
+        0.5 * r.y * r.y * mp.expansion[YY] +
+        0.041666666666666667 * r.y * r.y * r.y * r.y * mp.expansion[M];
+    if (term == XZZZ) return mp.expansion[XZZZ] + r.z * mp.expansion[XZZ] +
+        0.5 * r.z * r.z * mp.expansion[XZ] +
+        r.z * mp.expansion[ZZZ] +
+        r.x * r.z * mp.expansion[ZZ] +
+        0.1666666666666667 * r.x * r.z * r.z * r.z * mp.expansion[M];
+    if (term == XYZZ) return mp.expansion[XYZZ] + r.z * mp.expansion[XYZ] +
+        0.5 * r.z * r.z * mp.expansion[XY] +
+        r.y * mp.expansion[XZZ] +
+        r.y * r.z * mp.expansion[XZ] +
+        r.z * mp.expansion[YZZ] +
+        r.x * r.z * mp.expansion[YZ] +
+        r.x * r.y * mp.expansion[ZZ] +
+        0.5 * r.x * r.y * r.z * r.z * mp.expansion[M];
+    if (term == XYYZ) return mp.expansion[XYYZ] + r.z * mp.expansion[XYY] +
+        r.y * mp.expansion[XYZ] +
+        r.y * r.z * mp.expansion[XY] +
+        0.5 * r.y * r.y * mp.expansion[XZ] +
+        r.z * mp.expansion[YYZ] +
+        r.x * r.z * mp.expansion[YY] +
+        r.x * r.y * mp.expansion[YZ] +
+        0.5 * r.x * r.y * r.y * r.z * mp.expansion[M];
+    if (term == XYYY) return mp.expansion[XYYY] + r.y * mp.expansion[XYY] +
+        0.5 * r.y * r.y * mp.expansion[XY] +
+        r.z * mp.expansion[YYY] +
+        r.x * r.y * mp.expansion[YY] +
+        0.1666666666666667 * r.x * r.y * r.y * r.y * mp.expansion[M];
+    if (term == XXZZ) return mp.expansion[XXZZ] + r.z * mp.expansion[XXZ] +
+        0.5 * r.z * r.z * mp.expansion[XX] +
+        r.z * mp.expansion[XZZ] +
+        r.x * r.z * mp.expansion[XZ] +
+        0.5 * r.x * r.x * mp.expansion[ZZ] +
+        0.25 * r.x * r.x * r.z * r.z * mp.expansion[M];
+    if (term == XXYZ) return mp.expansion[XXYZ] + r.z * mp.expansion[XXY] +
+        r.y * mp.expansion[XXZ] +
+        r.y * r.z * mp.expansion[XX] +
+        r.z * mp.expansion[XYZ] +
+        r.x * r.z * mp.expansion[XY] +
+        r.x * r.y * mp.expansion[XZ] +
+        0.5 * r.x * r.x * mp.expansion[YZ] +
+        0.5 * r.x * r.x * r.y * r.z * mp.expansion[M];
+    if (term == XXYY) return mp.expansion[XXYY] + r.y * mp.expansion[XXY] +
+        0.5 * r.y * r.y * mp.expansion[XX] +
+        r.z * mp.expansion[XYY] +
+        r.x * r.y * mp.expansion[XY] +
+        0.5 * r.x * r.x * mp.expansion[YY] +
+        0.25 * r.x * r.x * r.y * r.y * mp.expansion[M];
+    if (term == XXXZ) return mp.expansion[XXXZ] + r.z * mp.expansion[XXX] +
+        r.z * mp.expansion[XXZ] +
+        r.x * r.z * mp.expansion[XX] +
+        0.5 * r.x * r.x * mp.expansion[XZ] +
+        0.1666666666666667 * r.x * r.x * r.x * r.z * mp.expansion[M];
+    if (term == XXXY) return mp.expansion[XXXY] + r.y * mp.expansion[XXX] +
+        r.z * mp.expansion[XXY] +
+        r.x * r.y * mp.expansion[XX] +
+        0.5 * r.x * r.x * mp.expansion[XY] +
+        0.1666666666666667 * r.x * r.x * r.x * r.y * mp.expansion[M];
+    if (term == XXXX) return mp.expansion[XXXX] + r.z * mp.expansion[XXX] +
+        0.5 * r.x * r.x * mp.expansion[XX] +
+        0.041666666666666667 * r.x * r.x * r.x * r.x * mp.expansion[M];
+#endif
     return 0.0;
 }
 

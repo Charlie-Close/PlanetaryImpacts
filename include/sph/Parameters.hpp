@@ -41,7 +41,12 @@ inline constexpr float gravityG = 6.67e-5f;
 inline constexpr float gravitySmoothingLength = 0.12f;
 inline constexpr float plumberEquivalent = 3.0f;
 inline constexpr float gravityEta = 0.001f;
-inline constexpr int expansionTerms = 20;
+inline constexpr int multipoleExpansionPower = 4;
+static_assert(multipoleExpansionPower >= 1 && multipoleExpansionPower <= 4,
+              "Vulkan multipole expansion currently supports powers 1 through 4");
+inline constexpr int expansionTerms =
+    ((multipoleExpansionPower + 1) * (multipoleExpansionPower + 2) * (multipoleExpansionPower + 3)) / 6;
+inline constexpr int multipolePowerTerms = multipoleExpansionPower + 1;
 inline constexpr int maxUncheckedPointers = 32;
 inline constexpr int maxLocalUncheckedPointers = 256;
 inline constexpr int gravityMaxRecursion = 8;

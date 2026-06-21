@@ -1014,9 +1014,9 @@ void VulkanSimulation::step(int maxTicks) {
                 float maxMinGrav = 0.0f;
                 float minSize = std::numeric_limits<float>::max();
                 float maxSize = 0.0f;
-                float maxPower3 = 0.0f;
+                float maxPowerP = 0.0f;
                 double meanSize = 0.0;
-                double meanPower3 = 0.0;
+                double meanPowerP = 0.0;
                 for (int32_t treePointer : treeLevels_[level]) {
                     if (treePointer < 0 || static_cast<size_t>(treePointer + 1) >= treeCapacity_) {
                         ++badData;
@@ -1042,9 +1042,10 @@ void VulkanSimulation::step(int maxTicks) {
                         maxSize = std::max(maxSize, mp.size);
                         meanSize += mp.size;
                     }
-                    if (std::isfinite(mp.power[3])) {
-                        maxPower3 = std::max(maxPower3, mp.power[3]);
-                        meanPower3 += mp.power[3];
+                    const float powerP = mp.power[MultipolePowerTerms - 1];
+                    if (std::isfinite(powerP)) {
+                        maxPowerP = std::max(maxPowerP, powerP);
+                        meanPowerP += powerP;
                     } else {
                         ++nonFinitePower;
                     }
@@ -1061,8 +1062,8 @@ void VulkanSimulation::step(int maxTicks) {
                           << " nonfiniteMinGrav=" << nonFiniteMinGrav
                           << " size=" << minSize << ".." << maxSize
                           << " meanSize=" << (nodes > 0.0 ? meanSize / nodes : 0.0)
-                          << " power3Max=" << maxPower3
-                          << " power3Mean=" << (nodes > 0.0 ? meanPower3 / nodes : 0.0)
+                          << " powerP" << (MultipolePowerTerms - 1) << "Max=" << maxPowerP
+                          << " powerP" << (MultipolePowerTerms - 1) << "Mean=" << (nodes > 0.0 ? meanPowerP / nodes : 0.0)
                           << " nonfinitePower=" << nonFinitePower
                           << "\n";
             }

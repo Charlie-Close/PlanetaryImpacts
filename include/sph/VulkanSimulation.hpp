@@ -50,6 +50,7 @@ public:
 
 private:
     static constexpr int ExpansionTerms = params::expansionTerms;
+    static constexpr int MultipolePowerTerms = params::multipolePowerTerms;
     static constexpr int MaxUncheckedPointers = params::maxUncheckedPointers;
 
     struct alignas(16) GpuMultipole {
@@ -58,7 +59,7 @@ private:
         Vec4 max{};
         float size = 0.0f;
         float expansion[ExpansionTerms]{};
-        float power[4]{};
+        float power[MultipolePowerTerms]{};
         float minGrav = 0.0f;
         float eta = 0.0f;
         float _pad[2]{};

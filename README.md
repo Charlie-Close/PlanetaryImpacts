@@ -18,6 +18,9 @@ Dependencies:
 
 The build compiles the GLSL compute shaders in `shaders/` to SPIR-V into the build directory.
 
+Gravity multipole order is controlled by `sph::params::multipoleExpansionPower` in `include/sph/Parameters.hpp`.
+The Vulkan port supports orders 1 through 4 and derives `N_EXPANSION_TERMS` from that value, matching the Metal parameter layout.
+
 ## Run
 
 ```sh
