@@ -119,13 +119,13 @@ void addPowers(int dataPointer) {
     float p3 = mp.expansion[ZZZ] * mp.expansion[ZZZ];
     p3 += (1.0 / 3.0) * mp.expansion[YZZ] * mp.expansion[YZZ];
     p3 += (1.0 / 3.0) * mp.expansion[YYZ] * mp.expansion[YYZ];
-    p3 = mp.expansion[YYY] * mp.expansion[YYY];
+    p3 += mp.expansion[YYY] * mp.expansion[YYY];
     p3 += (1.0 / 3.0) * mp.expansion[XZZ] * mp.expansion[XZZ];
     p3 += (1.0 / 6.0) * mp.expansion[XYZ] * mp.expansion[XYZ];
     p3 += (1.0 / 3.0) * mp.expansion[XYY] * mp.expansion[XYY];
     p3 += (1.0 / 3.0) * mp.expansion[XXZ] * mp.expansion[XXZ];
     p3 += (1.0 / 3.0) * mp.expansion[XXY] * mp.expansion[XXY];
-    p3 = mp.expansion[XXX] * mp.expansion[XXX];
+    p3 += mp.expansion[XXX] * mp.expansion[XXX];
     multipoles[dataPointer].power[3] = sqrt(max(p3, 0.0));
 #endif
 
@@ -267,7 +267,7 @@ float transformedExpansion(Multipole mp, vec3 r, int term) {
     if (term == XZ) return mp.expansion[XZ] + r.x * r.z * mp.expansion[M];
     if (term == YY) return mp.expansion[YY] + 0.5 * r.y * r.y * mp.expansion[M];
     if (term == YZ) return mp.expansion[YZ] + r.y * r.z * mp.expansion[M];
-    if (term == ZZ) return mp.expansion[ZZ] + 0.5 * r.z * r.z * mp.expansion[Z];
+    if (term == ZZ) return mp.expansion[ZZ] + 0.5 * r.z * r.z * mp.expansion[M];
 #endif
 #if MULTIPOLE_EXPANSION_POWER > 2
     if (term == ZZZ) return mp.expansion[ZZZ] + r.z * mp.expansion[ZZ] + 0.166666666667 * r.z * r.z * r.z * mp.expansion[M];
@@ -296,7 +296,7 @@ float transformedExpansion(Multipole mp, vec3 r, int term) {
         r.y * r.z * mp.expansion[YZ] +
         0.5 * r.y * r.y * mp.expansion[ZZ] +
         0.25 * r.y * r.y * r.z * r.z * mp.expansion[M];
-    if (term == YYYZ) return mp.expansion[YYZ] + r.z * mp.expansion[YYY] +
+    if (term == YYYZ) return mp.expansion[YYYZ] + r.z * mp.expansion[YYY] +
         r.y * mp.expansion[YYZ] +
         r.y * r.z * mp.expansion[YY] +
         0.5 * r.y * r.y * mp.expansion[YZ] +
@@ -306,14 +306,14 @@ float transformedExpansion(Multipole mp, vec3 r, int term) {
         0.041666666666666667 * r.y * r.y * r.y * r.y * mp.expansion[M];
     if (term == XZZZ) return mp.expansion[XZZZ] + r.z * mp.expansion[XZZ] +
         0.5 * r.z * r.z * mp.expansion[XZ] +
-        r.z * mp.expansion[ZZZ] +
+        r.x * mp.expansion[ZZZ] +
         r.x * r.z * mp.expansion[ZZ] +
         0.1666666666666667 * r.x * r.z * r.z * r.z * mp.expansion[M];
     if (term == XYZZ) return mp.expansion[XYZZ] + r.z * mp.expansion[XYZ] +
         0.5 * r.z * r.z * mp.expansion[XY] +
         r.y * mp.expansion[XZZ] +
         r.y * r.z * mp.expansion[XZ] +
-        r.z * mp.expansion[YZZ] +
+        r.x * mp.expansion[YZZ] +
         r.x * r.z * mp.expansion[YZ] +
         r.x * r.y * mp.expansion[ZZ] +
         0.5 * r.x * r.y * r.z * r.z * mp.expansion[M];
@@ -321,46 +321,46 @@ float transformedExpansion(Multipole mp, vec3 r, int term) {
         r.y * mp.expansion[XYZ] +
         r.y * r.z * mp.expansion[XY] +
         0.5 * r.y * r.y * mp.expansion[XZ] +
-        r.z * mp.expansion[YYZ] +
+        r.x * mp.expansion[YYZ] +
         r.x * r.z * mp.expansion[YY] +
         r.x * r.y * mp.expansion[YZ] +
         0.5 * r.x * r.y * r.y * r.z * mp.expansion[M];
     if (term == XYYY) return mp.expansion[XYYY] + r.y * mp.expansion[XYY] +
         0.5 * r.y * r.y * mp.expansion[XY] +
-        r.z * mp.expansion[YYY] +
+        r.x * mp.expansion[YYY] +
         r.x * r.y * mp.expansion[YY] +
         0.1666666666666667 * r.x * r.y * r.y * r.y * mp.expansion[M];
     if (term == XXZZ) return mp.expansion[XXZZ] + r.z * mp.expansion[XXZ] +
         0.5 * r.z * r.z * mp.expansion[XX] +
-        r.z * mp.expansion[XZZ] +
+        r.x * mp.expansion[XZZ] +
         r.x * r.z * mp.expansion[XZ] +
         0.5 * r.x * r.x * mp.expansion[ZZ] +
         0.25 * r.x * r.x * r.z * r.z * mp.expansion[M];
     if (term == XXYZ) return mp.expansion[XXYZ] + r.z * mp.expansion[XXY] +
         r.y * mp.expansion[XXZ] +
         r.y * r.z * mp.expansion[XX] +
-        r.z * mp.expansion[XYZ] +
+        r.x * mp.expansion[XYZ] +
         r.x * r.z * mp.expansion[XY] +
         r.x * r.y * mp.expansion[XZ] +
         0.5 * r.x * r.x * mp.expansion[YZ] +
         0.5 * r.x * r.x * r.y * r.z * mp.expansion[M];
     if (term == XXYY) return mp.expansion[XXYY] + r.y * mp.expansion[XXY] +
         0.5 * r.y * r.y * mp.expansion[XX] +
-        r.z * mp.expansion[XYY] +
+        r.x * mp.expansion[XYY] +
         r.x * r.y * mp.expansion[XY] +
         0.5 * r.x * r.x * mp.expansion[YY] +
         0.25 * r.x * r.x * r.y * r.y * mp.expansion[M];
     if (term == XXXZ) return mp.expansion[XXXZ] + r.z * mp.expansion[XXX] +
-        r.z * mp.expansion[XXZ] +
+        r.x * mp.expansion[XXZ] +
         r.x * r.z * mp.expansion[XX] +
         0.5 * r.x * r.x * mp.expansion[XZ] +
         0.1666666666666667 * r.x * r.x * r.x * r.z * mp.expansion[M];
     if (term == XXXY) return mp.expansion[XXXY] + r.y * mp.expansion[XXX] +
-        r.z * mp.expansion[XXY] +
+        r.x * mp.expansion[XXY] +
         r.x * r.y * mp.expansion[XX] +
         0.5 * r.x * r.x * mp.expansion[XY] +
         0.1666666666666667 * r.x * r.x * r.x * r.y * mp.expansion[M];
-    if (term == XXXX) return mp.expansion[XXXX] + r.z * mp.expansion[XXX] +
+    if (term == XXXX) return mp.expansion[XXXX] + r.x * mp.expansion[XXX] +
         0.5 * r.x * r.x * mp.expansion[XX] +
         0.041666666666666667 * r.x * r.x * r.x * r.x * mp.expansion[M];
 #endif
