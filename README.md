@@ -1,6 +1,120 @@
-# SPH Vulkan
+# PlanetaryImpacts
 
-This is a CMake C++ port of the `sph_metal` project layout. It keeps the same HDF5 input/output datasets, the same parameter values, the same aligned `float3` storage layout used by GPU buffers, and the same EOS table preprocessing.
+![Planetary impact simulation snapshot at 10^7.5 seconds](docs/assets/planetary-impact-snapshot-10e7-5.png)
+
+PlanetaryImpacts simulates planetary-scale collisions with smoothed particle hydrodynamics on the GPU. It uses Vulkan compute for simulation stepping, HDF5 datasets for input/output, aligned `float3` storage for GPU buffers, and EOS table preprocessing for material response. The interactive viewer and headless runner share the same GPU simulation path.
+
+## Quick Start
+
+These commands clone the project, install the core build dependencies, compile the Vulkan shaders, and start a long headless GPU run.
+
+### Ubuntu / Debian
+
+```sh
+sudo apt update
+sudo apt install -y \
+  git build-essential cmake \
+  libvulkan-dev vulkan-tools glslc \
+  libhdf5-dev libglfw3-dev
+
+git clone https://github.com/Charlie-Close/PlanetaryImpacts.git
+cd PlanetaryImpacts
+
+cmake -S . -B build
+cmake --build build -j 8
+
+./build/sph_vulkan --headless --steps 10000000
+```
+
+### Fedora
+
+```sh
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y \
+  git cmake gcc-c++ \
+  vulkan-devel vulkan-tools glslc \
+  hdf5-devel glfw-devel
+
+git clone https://github.com/Charlie-Close/PlanetaryImpacts.git
+cd PlanetaryImpacts
+
+cmake -S . -B build
+cmake --build build -j 8
+
+./build/sph_vulkan --headless --steps 10000000
+```
+
+### Arch Linux
+
+```sh
+sudo pacman -Syu --needed \
+  git base-devel cmake \
+  vulkan-headers vulkan-icd-loader vulkan-tools shaderc \
+  hdf5 glfw
+
+git clone https://github.com/Charlie-Close/PlanetaryImpacts.git
+cd PlanetaryImpacts
+
+cmake -S . -B build
+cmake --build build -j 8
+
+./build/sph_vulkan --headless --steps 10000000
+```
+
+### macOS
+
+Install Xcode Command Line Tools first:
+
+```sh
+xcode-select --install
+```
+
+Then install the dependencies with Homebrew and build:
+
+```sh
+brew install \
+  git cmake \
+  vulkan-headers vulkan-loader vulkan-tools shaderc \
+  hdf5 glfw molten-vk
+
+git clone https://github.com/Charlie-Close/PlanetaryImpacts.git
+cd PlanetaryImpacts
+
+cmake -S . -B build
+cmake --build build -j 8
+
+export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/share/vulkan/icd.d/MoltenVK_icd.json"
+./build/sph_vulkan --headless --steps 10000000
+```
+
+### Windows
+
+The simplest Windows route is WSL2 with Ubuntu. Install Ubuntu in WSL, then run the Ubuntu / Debian commands above inside the WSL shell.
+
+For a native Windows build, use the MSYS2 UCRT64 shell:
+
+```sh
+pacman -Syu
+pacman -S --needed \
+  git mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-vulkan-headers \
+  mingw-w64-ucrt-x86_64-vulkan-loader \
+  mingw-w64-ucrt-x86_64-vulkan-tools \
+  mingw-w64-ucrt-x86_64-shaderc \
+  mingw-w64-ucrt-x86_64-hdf5 \
+  mingw-w64-ucrt-x86_64-glfw
+
+git clone https://github.com/Charlie-Close/PlanetaryImpacts.git
+cd PlanetaryImpacts
+
+cmake -S . -B build -G Ninja
+cmake --build build -j 8
+
+./build/sph_vulkan.exe --headless --steps 10000000
+```
+
+Vulkan also needs a working GPU driver/runtime for your hardware. If you are checking an install, `vulkaninfo --summary` and `./build/sph_vulkan --info` are useful first tests.
 
 ## Build
 
@@ -15,11 +129,12 @@ Dependencies:
 - C++20 compiler
 - Vulkan SDK, including `glslc`
 - HDF5 C library
+- GLFW 3.3+ for the viewer, unless building with `-DSPH_VULKAN_BUILD_VIEWER=OFF`
 
 The build compiles the GLSL compute shaders in `shaders/` to SPIR-V into the build directory.
 
 Gravity multipole order is controlled by `sph::params::multipoleExpansionPower` in `include/sph/Parameters.hpp`.
-The Vulkan port supports orders 1 through 4 and derives `N_EXPANSION_TERMS` from that value, matching the Metal parameter layout.
+The Vulkan shaders support orders 1 through 4 and derive `N_EXPANSION_TERMS` from that value.
 
 ## Run
 
@@ -53,7 +168,7 @@ Viewer controls:
 - `W`/`S`: forward/back.
 - `A`/`D`: strafe.
 - `Q`/`E`: up/down.
-- Drag: rotate, with the same sensitivity as the Metal camera.
+- Drag: rotate the camera.
 - `P`: print camera position and pitch/yaw.
 - `R`: reset camera.
 - Esc: close.
