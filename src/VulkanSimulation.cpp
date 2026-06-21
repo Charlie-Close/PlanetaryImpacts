@@ -11,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include "lodepng.h"
 #include "sph/Octree.hpp"
@@ -29,16 +30,6 @@ struct SnapshotCameraUniform {
     float cameraPos[4]{};
     float params[4]{};
 };
-
-template <typename T>
-void copyToMapped(const VulkanSimulation::Buffer& buffer, const std::vector<T>& values) {
-    if (!values.empty()) std::memcpy(buffer.mapped, values.data(), sizeof(T) * values.size());
-}
-
-template <typename T>
-void copyFromMapped(std::vector<T>& values, const VulkanSimulation::Buffer& buffer) {
-    if (!values.empty()) std::memcpy(values.data(), buffer.mapped, sizeof(T) * values.size());
-}
 
 bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
     uint32_t extensionCount = 0;
@@ -341,16 +332,28 @@ void VulkanSimulation::createCommandResources() {
     check(vkCreateFence(device_, &fenceInfo, nullptr, &octreeReadbackFence_), "vkCreateFence octree readback");
 }
 
-uint32_t VulkanSimulation::findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferredFlags) const {
+uint32_t VulkanSimulation::findMemory(uint32_t typeBits,
+                                      VkMemoryPropertyFlags flags,
+                                      VkMemoryPropertyFlags preferredFlags,
+                                      VkDeviceSize allocationSize) const {
     VkPhysicalDeviceMemoryProperties props{};
     vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &props);
+    const auto heapFits = [&](uint32_t typeIndex) {
+        if (allocationSize == 0) return true;
+        const uint32_t heapIndex = props.memoryTypes[typeIndex].heapIndex;
+        return props.memoryHeaps[heapIndex].size >= allocationSize;
+    };
     if (preferredFlags != 0) {
         for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags) return i;
+            if ((typeBits & (1u << i)) &&
+                (props.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags &&
+                heapFits(i)) return i;
         }
     }
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags) return i;
+        if ((typeBits & (1u << i)) &&
+            (props.memoryTypes[i].propertyFlags & flags) == flags &&
+            heapFits(i)) return i;
     }
     throw std::runtime_error("No compatible Vulkan memory type found");
 }
@@ -371,7 +374,7 @@ VulkanSimulation::Buffer VulkanSimulation::createBuffer(VkDeviceSize size, VkBuf
         (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0 &&
         (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     const VkMemoryPropertyFlags preferred = preferDeviceLocal ? (properties | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : 0;
-    alloc.memoryTypeIndex = findMemory(req.memoryTypeBits, properties, preferred);
+    alloc.memoryTypeIndex = findMemory(req.memoryTypeBits, properties, preferred, req.size);
     check(vkAllocateMemory(device_, &alloc, nullptr, &out.memory), "vkAllocateMemory");
     check(vkBindBufferMemory(device_, out.buffer, out.memory, 0), "vkBindBufferMemory");
     if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -387,104 +390,204 @@ void VulkanSimulation::destroyBuffer(Buffer& buffer) {
     buffer = {};
 }
 
+void VulkanSimulation::copyBufferBlocking(const Buffer& src, const Buffer& dst, VkDeviceSize size, const char* what) {
+    if (size == 0) return;
+    const char* label = what != nullptr ? what : "buffer copy";
+
+    VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    alloc.commandPool = commandPool_;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 1;
+    VkCommandBuffer copyCommand = VK_NULL_HANDLE;
+    check(vkAllocateCommandBuffers(device_, &alloc, &copyCommand), (std::string("vkAllocateCommandBuffers ") + label).c_str());
+
+    VkFence copyFence = VK_NULL_HANDLE;
+    try {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        check(vkCreateFence(device_, &fenceInfo, nullptr, &copyFence), (std::string("vkCreateFence ") + label).c_str());
+
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(copyCommand, &begin), (std::string("vkBeginCommandBuffer ") + label).c_str());
+
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(copyCommand,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &before, 0, nullptr, 0, nullptr);
+
+        VkBufferCopy copy{};
+        copy.size = size;
+        vkCmdCopyBuffer(copyCommand, src.buffer, dst.buffer, 1, &copy);
+
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(copyCommand,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &after, 0, nullptr, 0, nullptr);
+
+        check(vkEndCommandBuffer(copyCommand), (std::string("vkEndCommandBuffer ") + label).c_str());
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &copyCommand;
+        check(vkQueueSubmit(queue_, 1, &submit, copyFence), (std::string("vkQueueSubmit ") + label).c_str());
+        check(vkWaitForFences(device_, 1, &copyFence, VK_TRUE, UINT64_MAX), (std::string("vkWaitForFences ") + label).c_str());
+    } catch (...) {
+        if (copyFence) vkDestroyFence(device_, copyFence, nullptr);
+        if (copyCommand) vkFreeCommandBuffers(device_, commandPool_, 1, &copyCommand);
+        throw;
+    }
+
+    vkDestroyFence(device_, copyFence, nullptr);
+    vkFreeCommandBuffers(device_, commandPool_, 1, &copyCommand);
+}
+
+void VulkanSimulation::uploadBuffer(const Buffer& dst, const void* data, VkDeviceSize size, const char* what) {
+    if (size == 0) return;
+    if (dst.mapped) {
+        std::memcpy(dst.mapped, data, static_cast<size_t>(size));
+        return;
+    }
+
+    const VkMemoryPropertyFlags hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    Buffer staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, hostCoherent);
+    try {
+        std::memcpy(staging.mapped, data, static_cast<size_t>(size));
+        copyBufferBlocking(staging, dst, size, what);
+    } catch (...) {
+        destroyBuffer(staging);
+        throw;
+    }
+    destroyBuffer(staging);
+}
+
+void VulkanSimulation::downloadBuffer(const Buffer& src, void* data, VkDeviceSize size, const char* what) {
+    if (size == 0) return;
+    if (src.mapped) {
+        std::memcpy(data, src.mapped, static_cast<size_t>(size));
+        return;
+    }
+
+    const VkMemoryPropertyFlags hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    Buffer staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
+    try {
+        copyBufferBlocking(src, staging, size, what);
+        std::memcpy(data, staging.mapped, static_cast<size_t>(size));
+    } catch (...) {
+        destroyBuffer(staging);
+        throw;
+    }
+    destroyBuffer(staging);
+}
+
 void VulkanSimulation::createBuffers() {
     const VkMemoryPropertyFlags hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto n = static_cast<VkDeviceSize>(particleCount_);
-    positions_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    velocities_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    densities_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    internalEnergy_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    masses_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    smoothingLengths_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    pressures_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    materialIds_ = createBuffer(n * sizeof(int32_t), storage, hostCoherent);
-    temperatures_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    alive_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
+    positions_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    velocities_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    densities_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    internalEnergy_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    masses_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    smoothingLengths_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    pressures_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    materialIds_ = createBuffer(n * sizeof(int32_t), storage, deviceLocal);
+    temperatures_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    alive_ = createBuffer(n * sizeof(uint32_t), storage, deviceLocal);
     octreePositionsReadback_ = createBuffer(n * sizeof(Vec3), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
     octreeAliveReadback_ = createBuffer(n * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
-    accelerations_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    gravAccelerations_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    dInternalEnergy_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    dhDt_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    gravAbs_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    cellArrayA_ = createBuffer(n * sizeof(uint32_t) * 2, storage, hostCoherent);
-    cellArrayB_ = createBuffer(n * sizeof(uint32_t) * 2, storage, hostCoherent);
-    largeParticleCells_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
+    accelerations_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    gravAccelerations_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    dInternalEnergy_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    dhDt_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    gravAbs_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    cellArrayA_ = createBuffer(n * sizeof(uint32_t) * 2, storage, deviceLocal);
+    cellArrayB_ = createBuffer(n * sizeof(uint32_t) * 2, storage, deviceLocal);
+    largeParticleCells_ = createBuffer(n * sizeof(uint32_t), storage, deviceLocal);
     const uint32_t nBlocks = (particleCount_ / params::sortingBlockSize) + 1;
-    bucketHist_ = createBuffer(static_cast<VkDeviceSize>(nBlocks) * params::sortingBucketNumber * sizeof(uint32_t), storage, hostCoherent);
-    bucketOffset_ = createBuffer(params::sortingBucketNumber * sizeof(uint32_t), storage, hostCoherent);
-    particleOffset_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
+    bucketHist_ = createBuffer(static_cast<VkDeviceSize>(nBlocks) * params::sortingBucketNumber * sizeof(uint32_t), storage, deviceLocal);
+    bucketOffset_ = createBuffer(params::sortingBucketNumber * sizeof(uint32_t), storage, deviceLocal);
+    particleOffset_ = createBuffer(n * sizeof(uint32_t), storage, deviceLocal);
     cellTableSize_ = 1u << (3 * params::cellPower);
     const VkDeviceSize cellCount = cellTableSize_;
-    cellStart_ = createBuffer(cellCount * sizeof(uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    cellEnd_ = createBuffer(cellCount * sizeof(uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    accelerations1_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    dInternalEnergy1_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    gradientTerms_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    rhoGrads_ = createBuffer(n * sizeof(Vec3), storage, hostCoherent);
-    particleIds_ = createBuffer(n * sizeof(int32_t), storage, hostCoherent);
-    speedOfSound_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    balsara_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    alpha_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    daDt_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    alphaLoc_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    pAlphaLoc_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    localMaxH_ = createBuffer(n * sizeof(float), storage, hostCoherent);
-    nextActiveTime_ = createBuffer(n * sizeof(int32_t), storage, hostCoherent);
+    cellStart_ = createBuffer(cellCount * sizeof(uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, deviceLocal);
+    cellEnd_ = createBuffer(cellCount * sizeof(uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, deviceLocal);
+    accelerations1_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    dInternalEnergy1_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    gradientTerms_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    rhoGrads_ = createBuffer(n * sizeof(Vec3), storage, deviceLocal);
+    particleIds_ = createBuffer(n * sizeof(int32_t), storage, deviceLocal);
+    speedOfSound_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    balsara_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    alpha_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    daDt_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    alphaLoc_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    pAlphaLoc_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    localMaxH_ = createBuffer(n * sizeof(float), storage, deviceLocal);
+    nextActiveTime_ = createBuffer(n * sizeof(int32_t), storage, deviceLocal);
     stepTicks_ = createBuffer(sizeof(int32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
-    active_ = createBuffer(n * sizeof(uint32_t), storage, hostCoherent);
+    active_ = createBuffer(n * sizeof(uint32_t), storage, deviceLocal);
     gravityStepTicks_ = createBuffer(sizeof(int32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostCoherent);
     const VkBufferUsageFlags shuffleScratchUsage = storage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    scratchPositions_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchVelocities_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchDensities_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchInternalEnergy_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchMasses_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchSmoothingLengths_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchPressures_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchMaterialIds_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, hostCoherent);
-    scratchTemperatures_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchAlive_ = createBuffer(n * sizeof(uint32_t), shuffleScratchUsage, hostCoherent);
-    scratchAccelerations_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchGravAccelerations_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchDInternalEnergy_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchDhDt_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchGravAbs_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchAccelerations1_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchDInternalEnergy1_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchGradientTerms_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchRhoGrads_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, hostCoherent);
-    scratchSpeedOfSound_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchBalsara_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchAlpha_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchDaDt_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchAlphaLoc_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchPAlphaLoc_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchLocalMaxH_ = createBuffer(n * sizeof(float), shuffleScratchUsage, hostCoherent);
-    scratchNextActiveTime_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, hostCoherent);
-    scratchParticleIds_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, hostCoherent);
+    scratchPositions_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchVelocities_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchDensities_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchInternalEnergy_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchMasses_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchSmoothingLengths_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchPressures_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchMaterialIds_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, deviceLocal);
+    scratchTemperatures_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchAlive_ = createBuffer(n * sizeof(uint32_t), shuffleScratchUsage, deviceLocal);
+    scratchAccelerations_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchGravAccelerations_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchDInternalEnergy_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchDhDt_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchGravAbs_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchAccelerations1_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchDInternalEnergy1_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchGradientTerms_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchRhoGrads_ = createBuffer(n * sizeof(Vec3), shuffleScratchUsage, deviceLocal);
+    scratchSpeedOfSound_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchBalsara_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchAlpha_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchDaDt_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchAlphaLoc_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchPAlphaLoc_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchLocalMaxH_ = createBuffer(n * sizeof(float), shuffleScratchUsage, deviceLocal);
+    scratchNextActiveTime_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, deviceLocal);
+    scratchParticleIds_ = createBuffer(n * sizeof(int32_t), shuffleScratchUsage, deviceLocal);
 
     const EquationOfState& eos = simulator_.equationOfState();
     const std::array<const AneosTable*, 6> eosTables = {&eos.iron, &eos.forsterite, &eos.fe85si15, &eos.hhe, &eos.ice, &eos.rock};
     size_t eosValueCount = 0;
     for (const AneosTable* table : eosTables) eosValueCount += table->data.size();
-    eosTables_ = createBuffer(std::max<VkDeviceSize>(1, static_cast<VkDeviceSize>(eosValueCount)) * sizeof(Vec4), storage, hostCoherent);
-    eosMeta_ = createBuffer(eosTables.size() * sizeof(GpuEosMeta), storage, hostCoherent);
+    eosTables_ = createBuffer(std::max<VkDeviceSize>(1, static_cast<VkDeviceSize>(eosValueCount)) * sizeof(Vec4), storage, deviceLocal);
+    eosMeta_ = createBuffer(eosTables.size() * sizeof(GpuEosMeta), storage, deviceLocal);
 }
 
 void VulkanSimulation::uploadInitialState() {
     const DataSet& data = simulator_.data();
-    copyToMapped(positions_, data.positions);
-    copyToMapped(velocities_, data.velocities);
-    copyToMapped(densities_, data.densities);
-    copyToMapped(internalEnergy_, data.internalEnergy);
-    copyToMapped(masses_, data.masses);
-    copyToMapped(smoothingLengths_, data.smoothingLengths);
-    copyToMapped(pressures_, data.pressures);
-    copyToMapped(materialIds_, data.materialIds);
-    copyToMapped(particleIds_, data.particleIds);
-    copyToMapped(temperatures_, data.temperatures);
+    auto uploadVector = [&](const Buffer& buffer, const auto& values, const char* what) {
+        using Value = typename std::decay_t<decltype(values)>::value_type;
+        uploadBuffer(buffer, values.data(), static_cast<VkDeviceSize>(values.size()) * sizeof(Value), what);
+    };
+    uploadVector(positions_, data.positions, "upload positions");
+    uploadVector(velocities_, data.velocities, "upload velocities");
+    uploadVector(densities_, data.densities, "upload densities");
+    uploadVector(internalEnergy_, data.internalEnergy, "upload internal energy");
+    uploadVector(masses_, data.masses, "upload masses");
+    uploadVector(smoothingLengths_, data.smoothingLengths, "upload smoothing lengths");
+    uploadVector(pressures_, data.pressures, "upload pressures");
+    uploadVector(materialIds_, data.materialIds, "upload material ids");
+    uploadVector(particleIds_, data.particleIds, "upload particle ids");
+    uploadVector(temperatures_, data.temperatures, "upload temperatures");
     aliveHost_.assign(particleCount_, 1u);
     std::vector<Vec3> zeros3(particleCount_);
     std::vector<float> zeros(particleCount_, 0.0f);
@@ -492,54 +595,57 @@ void VulkanSimulation::uploadInitialState() {
         Vec3 translated = data.positions[i] - makeVec3(params::boxCenter, params::boxCenter, params::boxCenter);
         aliveHost_[i] = (std::abs(translated.x) <= params::boxSize && std::abs(translated.y) <= params::boxSize && std::abs(translated.z) <= params::boxSize) ? 1u : 0u;
     }
-    std::memcpy(alive_.mapped, aliveHost_.data(), aliveHost_.size() * sizeof(uint32_t));
-    copyToMapped(accelerations_, zeros3);
-    copyToMapped(gravAccelerations_, zeros3);
-    copyToMapped(dInternalEnergy_, zeros);
-    copyToMapped(dhDt_, zeros);
-    copyToMapped(gravAbs_, zeros);
-    copyToMapped(accelerations1_, zeros3);
-    copyToMapped(dInternalEnergy1_, zeros);
+    uploadVector(alive_, aliveHost_, "upload alive flags");
+    uploadVector(accelerations_, zeros3, "upload accelerations");
+    uploadVector(gravAccelerations_, zeros3, "upload gravity accelerations");
+    uploadVector(dInternalEnergy_, zeros, "upload internal energy derivatives");
+    uploadVector(dhDt_, zeros, "upload smoothing length derivatives");
+    uploadVector(gravAbs_, zeros, "upload gravity magnitudes");
+    uploadVector(accelerations1_, zeros3, "upload acceleration scratch");
+    uploadVector(dInternalEnergy1_, zeros, "upload internal energy derivative scratch");
     std::vector<float> ones(particleCount_, 1.0f);
     std::vector<float> alpha(particleCount_, params::viscosityAlpha);
     std::vector<int32_t> nextActive(particleCount_, 0);
     std::vector<uint32_t> active(particleCount_, 1u);
     int32_t initialStepTicks = 1;
-    copyToMapped(gradientTerms_, ones);
-    copyToMapped(rhoGrads_, zeros3);
-    copyToMapped(speedOfSound_, ones);
-    copyToMapped(balsara_, ones);
-    copyToMapped(alpha_, alpha);
-    copyToMapped(daDt_, zeros);
-    copyToMapped(alphaLoc_, alpha);
-    copyToMapped(pAlphaLoc_, alpha);
-    copyToMapped(localMaxH_, data.smoothingLengths);
-    copyToMapped(nextActiveTime_, nextActive);
-    copyToMapped(active_, active);
-    copyToMapped(stepTicks_, std::vector<int32_t>{initialStepTicks});
-    copyToMapped(gravityStepTicks_, std::vector<int32_t>{initialStepTicks});
+    uploadVector(gradientTerms_, ones, "upload gradient terms");
+    uploadVector(rhoGrads_, zeros3, "upload density gradients");
+    uploadVector(speedOfSound_, ones, "upload sound speeds");
+    uploadVector(balsara_, ones, "upload balsara");
+    uploadVector(alpha_, alpha, "upload viscosity alpha");
+    uploadVector(daDt_, zeros, "upload viscosity alpha derivatives");
+    uploadVector(alphaLoc_, alpha, "upload local alpha");
+    uploadVector(pAlphaLoc_, alpha, "upload predicted local alpha");
+    uploadVector(localMaxH_, data.smoothingLengths, "upload local max smoothing lengths");
+    uploadVector(nextActiveTime_, nextActive, "upload next active times");
+    uploadVector(active_, active, "upload active flags");
+    uploadBuffer(stepTicks_, &initialStepTicks, sizeof(initialStepTicks), "upload step ticks");
+    uploadBuffer(gravityStepTicks_, &initialStepTicks, sizeof(initialStepTicks), "upload gravity step ticks");
 
     const EquationOfState& eos = simulator_.equationOfState();
     const std::array<const AneosTable*, 6> eosTables = {&eos.iron, &eos.forsterite, &eos.fe85si15, &eos.hhe, &eos.ice, &eos.rock};
     std::vector<GpuEosMeta> eosMeta(eosTables.size());
-    Vec4* eosMapped = static_cast<Vec4*>(eosTables_.mapped);
+    size_t eosValueCount = 0;
+    for (const AneosTable* table : eosTables) eosValueCount += table->data.size();
+    std::vector<Vec4> eosValues(eosValueCount);
     size_t eosOffset = 0;
     for (size_t i = 0; i < eosTables.size(); ++i) {
         eosMeta[i].offset = static_cast<int32_t>(eosOffset);
         eosMeta[i].resolution = eosTables[i]->resolution;
         if (!eosTables[i]->data.empty()) {
-            std::memcpy(eosMapped + eosOffset, eosTables[i]->data.data(), eosTables[i]->data.size() * sizeof(Vec4));
+            std::memcpy(eosValues.data() + eosOffset, eosTables[i]->data.data(), eosTables[i]->data.size() * sizeof(Vec4));
         }
         eosOffset += eosTables[i]->data.size();
     }
-    copyToMapped(eosMeta_, eosMeta);
+    uploadVector(eosTables_, eosValues, "upload EOS tables");
+    uploadVector(eosMeta_, eosMeta, "upload EOS metadata");
     rebuildOctreeBuffers();
 }
 
 void VulkanSimulation::rebuildOctreeBuffers() {
     std::vector<Vec3> positions(particleCount_);
-    copyFromMapped(positions, positions_);
-    std::memcpy(aliveHost_.data(), alive_.mapped, aliveHost_.size() * sizeof(uint32_t));
+    downloadBuffer(positions_, positions.data(), positions.size() * sizeof(Vec3), "download octree positions");
+    downloadBuffer(alive_, aliveHost_.data(), aliveHost_.size() * sizeof(uint32_t), "download octree alive flags");
     const OctreeData octree = buildOctree(positions, aliveHost_, 8, std::max<size_t>(treeCapacity_, positions.size() * 2));
     applyOctreeData(octree);
 }
@@ -547,21 +653,21 @@ void VulkanSimulation::rebuildOctreeBuffers() {
 void VulkanSimulation::applyOctreeData(const OctreeData& octree) {
     treeLevels_ = octree.levels;
 
-    const VkMemoryPropertyFlags hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (octree.tree.size() > treeCapacity_) {
         destroyBuffer(tree_);
         treeCapacity_ = static_cast<size_t>(static_cast<double>(octree.tree.size()) * 1.1) + 64;
-        tree_ = createBuffer(treeCapacity_ * sizeof(int32_t), storage, hostCoherent);
+        tree_ = createBuffer(treeCapacity_ * sizeof(int32_t), storage, deviceLocal);
     }
     if (static_cast<size_t>(octree.nodeValues) > nodeCapacity_) {
         destroyBuffer(multipoles_);
         destroyBuffer(locals_);
         destroyBuffer(parentIndexes_);
         nodeCapacity_ = static_cast<size_t>(static_cast<double>(octree.nodeValues) * 1.1) + 64;
-        multipoles_ = createBuffer(nodeCapacity_ * sizeof(GpuMultipole), storage, hostCoherent);
-        locals_ = createBuffer(nodeCapacity_ * sizeof(GpuLocal), storage, hostCoherent);
-        parentIndexes_ = createBuffer(nodeCapacity_ * sizeof(uint32_t), storage, hostCoherent);
+        multipoles_ = createBuffer(nodeCapacity_ * sizeof(GpuMultipole), storage, deviceLocal);
+        locals_ = createBuffer(nodeCapacity_ * sizeof(GpuLocal), storage, deviceLocal);
+        parentIndexes_ = createBuffer(nodeCapacity_ * sizeof(uint32_t), storage, deviceLocal);
     }
     size_t totalLevelEntries = 0;
     size_t maxLevel = 0;
@@ -575,23 +681,24 @@ void VulkanSimulation::applyOctreeData(const OctreeData& octree) {
     if (totalLevelEntries > levelCapacity_) {
         destroyBuffer(treeLevel_);
         levelCapacity_ = static_cast<size_t>(static_cast<double>(totalLevelEntries) * 1.1) + 64;
-        treeLevel_ = createBuffer(levelCapacity_ * sizeof(int32_t), storage, hostCoherent);
+        treeLevel_ = createBuffer(levelCapacity_ * sizeof(int32_t), storage, deviceLocal);
     }
-    int32_t* levelMapped = static_cast<int32_t*>(treeLevel_.mapped);
+    std::vector<int32_t> levelData(totalLevelEntries);
     for (size_t level = 0; level < treeLevels_.size(); ++level) {
         if (!treeLevels_[level].empty()) {
-            std::memcpy(levelMapped + treeLevelOffsets_[level], treeLevels_[level].data(), treeLevels_[level].size() * sizeof(int32_t));
+            std::memcpy(levelData.data() + treeLevelOffsets_[level], treeLevels_[level].data(), treeLevels_[level].size() * sizeof(int32_t));
         }
     }
+    uploadBuffer(treeLevel_, levelData.data(), levelData.size() * sizeof(int32_t), "upload octree levels");
     const size_t localGravSize = std::max<size_t>(1, maxLevel * MaxUncheckedPointers);
     if (localGravSize > localGravCapacity_) {
         destroyBuffer(localGravA_);
         destroyBuffer(localGravB_);
         localGravCapacity_ = static_cast<size_t>(static_cast<double>(localGravSize) * 1.1) + 64;
-        localGravA_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, hostCoherent);
-        localGravB_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, hostCoherent);
+        localGravA_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, deviceLocal);
+        localGravB_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, deviceLocal);
     }
-    if (!octree.tree.empty()) std::memcpy(tree_.mapped, octree.tree.data(), octree.tree.size() * sizeof(int32_t));
+    uploadBuffer(tree_, octree.tree.data(), octree.tree.size() * sizeof(int32_t), "upload octree");
     if (descriptorSet_ != VK_NULL_HANDLE) updateDescriptorSet();
 }
 
@@ -975,9 +1082,15 @@ void VulkanSimulation::step(int maxTicks) {
         }
         submitProfileSegment("gravity up");
         if (traceGravityStats) {
-            const auto* multipoles = static_cast<const GpuMultipole*>(multipoles_.mapped);
-            const auto* tree = static_cast<const int32_t*>(tree_.mapped);
-            const auto* gravAbs = static_cast<const float*>(gravAbs_.mapped);
+            std::vector<GpuMultipole> multipolesHost(nodeCapacity_);
+            std::vector<int32_t> treeHost(treeCapacity_);
+            std::vector<float> gravAbsHost(particleCount_);
+            downloadBuffer(multipoles_, multipolesHost.data(), multipolesHost.size() * sizeof(GpuMultipole), "download gravity stats multipoles");
+            downloadBuffer(tree_, treeHost.data(), treeHost.size() * sizeof(int32_t), "download gravity stats tree");
+            downloadBuffer(gravAbs_, gravAbsHost.data(), gravAbsHost.size() * sizeof(float), "download gravity stats magnitudes");
+            const auto* multipoles = multipolesHost.data();
+            const auto* tree = treeHost.data();
+            const auto* gravAbs = gravAbsHost.data();
             uint32_t gravZero = 0;
             uint32_t gravNonFinite = 0;
             float gravMin = std::numeric_limits<float>::max();
@@ -1108,9 +1221,15 @@ void VulkanSimulation::step(int maxTicks) {
             }
             if (traceGravityBuffers) {
                 const Buffer& outBuffer = (level & 1u) == 0u ? localGravB_ : localGravA_;
-                const auto* out = static_cast<const int32_t*>(outBuffer.mapped);
-                const auto* tree = static_cast<const int32_t*>(tree_.mapped);
-                const auto* parentIndexes = static_cast<const uint32_t*>(parentIndexes_.mapped);
+                std::vector<int32_t> outHost(localGravCapacity_);
+                std::vector<int32_t> treeHost(treeCapacity_);
+                std::vector<uint32_t> parentIndexesHost(nodeCapacity_);
+                downloadBuffer(outBuffer, outHost.data(), outHost.size() * sizeof(int32_t), "download gravity trace output");
+                downloadBuffer(tree_, treeHost.data(), treeHost.size() * sizeof(int32_t), "download gravity trace tree");
+                downloadBuffer(parentIndexes_, parentIndexesHost.data(), parentIndexesHost.size() * sizeof(uint32_t), "download gravity trace parents");
+                const auto* out = outHost.data();
+                const auto* tree = treeHost.data();
+                const auto* parentIndexes = parentIndexesHost.data();
                 uint32_t noSentinel = 0;
                 uint32_t invalidEntries = 0;
                 int32_t maxUsed = 0;
@@ -1289,7 +1408,9 @@ void VulkanSimulation::step(int maxTicks) {
     if (kTraceSimulationPasses) std::cout << "GPU simulation step completed." << std::endl;
     if (debugStats) {
         auto printScalarStats = [&](const char* name, const Buffer& buffer) {
-            const float* values = static_cast<const float*>(buffer.mapped);
+            std::vector<float> values(particleCount_);
+            const std::string label = std::string("download stats ") + name;
+            downloadBuffer(buffer, values.data(), values.size() * sizeof(float), label.c_str());
             std::vector<float> finite;
             finite.reserve(particleCount_);
             for (uint32_t i = 0; i < particleCount_; ++i) {
@@ -1311,7 +1432,9 @@ void VulkanSimulation::step(int maxTicks) {
                       << " max=" << finite.back() << "\n";
         };
         auto printVecStats = [&](const char* name, const Buffer& buffer) {
-            const Vec3* values = static_cast<const Vec3*>(buffer.mapped);
+            std::vector<Vec3> values(particleCount_);
+            const std::string label = std::string("download stats ") + name;
+            downloadBuffer(buffer, values.data(), values.size() * sizeof(Vec3), label.c_str());
             std::vector<float> finite;
             finite.reserve(particleCount_);
             for (uint32_t i = 0; i < particleCount_; ++i) {
@@ -1342,11 +1465,17 @@ void VulkanSimulation::step(int maxTicks) {
         printVecStats("hydro_acc", accelerations_);
         printVecStats("grav_acc", gravAccelerations_);
         printVecStats("velocity", velocities_);
-        const auto* active = static_cast<const uint32_t*>(active_.mapped);
+        std::vector<uint32_t> activeHost(particleCount_);
+        downloadBuffer(active_, activeHost.data(), activeHost.size() * sizeof(uint32_t), "download stats active flags");
+        const auto* active = activeHost.data();
         uint32_t activeCount = 0;
         for (uint32_t i = 0; i < particleCount_; ++i) activeCount += active[i] != 0u ? 1u : 0u;
-        const auto* cells = static_cast<const uint32_t*>(cellArrayA_.mapped);
-        const auto* positions = static_cast<const Vec3*>(positions_.mapped);
+        std::vector<uint32_t> cellsHost(static_cast<size_t>(particleCount_) * 2);
+        std::vector<Vec3> positionsHost(particleCount_);
+        downloadBuffer(cellArrayA_, cellsHost.data(), cellsHost.size() * sizeof(uint32_t), "download stats cells");
+        downloadBuffer(positions_, positionsHost.data(), positionsHost.size() * sizeof(Vec3), "download stats positions");
+        const auto* cells = cellsHost.data();
+        const auto* positions = positionsHost.data();
         auto splitBy3 = [](uint32_t a) {
             uint32_t x = a & 0x000003ffu;
             x = (x | (x << 16)) & 0x030000FFu;
@@ -1404,12 +1533,12 @@ void VulkanSimulation::step(int maxTicks) {
         std::cout << "\n";
     }
     int32_t completedTicks = 0;
-    std::memcpy(&completedTicks, stepTicks_.mapped, sizeof(completedTicks));
+    downloadBuffer(stepTicks_, &completedTicks, sizeof(completedTicks), "download completed step ticks");
     completedTicks = std::max(completedTicks, 1);
     if (maxTicks > 0) completedTicks = std::min(completedTicks, maxTicks);
     if (runGravity) {
         int32_t gravityTicks = 0;
-        std::memcpy(&gravityTicks, gravityStepTicks_.mapped, sizeof(gravityTicks));
+        downloadBuffer(gravityStepTicks_, &gravityTicks, sizeof(gravityTicks), "download gravity step ticks");
         gravityTicks = std::clamp(gravityTicks, 1, static_cast<int32_t>(params::maxDt / params::minDt));
         gravityNextActiveTicks_ = stepStartTicks + gravityTicks;
         gravityPredictionTicks_ = gravityTicks;
@@ -1932,14 +2061,14 @@ void VulkanSimulation::writeSnapshot(const std::filesystem::path& path, Vec3 cam
 
 void VulkanSimulation::syncToSimulator() {
     DataSet& data = simulator_.mutableData();
-    copyFromMapped(data.positions, positions_);
-    copyFromMapped(data.velocities, velocities_);
-    copyFromMapped(data.densities, densities_);
-    copyFromMapped(data.internalEnergy, internalEnergy_);
-    copyFromMapped(data.smoothingLengths, smoothingLengths_);
-    copyFromMapped(data.pressures, pressures_);
-    copyFromMapped(data.temperatures, temperatures_);
-    copyFromMapped(data.particleIds, particleIds_);
+    downloadBuffer(positions_, data.positions.data(), data.positions.size() * sizeof(Vec3), "download final positions");
+    downloadBuffer(velocities_, data.velocities.data(), data.velocities.size() * sizeof(Vec3), "download final velocities");
+    downloadBuffer(densities_, data.densities.data(), data.densities.size() * sizeof(float), "download final densities");
+    downloadBuffer(internalEnergy_, data.internalEnergy.data(), data.internalEnergy.size() * sizeof(float), "download final internal energy");
+    downloadBuffer(smoothingLengths_, data.smoothingLengths.data(), data.smoothingLengths.size() * sizeof(float), "download final smoothing lengths");
+    downloadBuffer(pressures_, data.pressures.data(), data.pressures.size() * sizeof(float), "download final pressures");
+    downloadBuffer(temperatures_, data.temperatures.data(), data.temperatures.size() * sizeof(float), "download final temperatures");
+    downloadBuffer(particleIds_, data.particleIds.data(), data.particleIds.size() * sizeof(int32_t), "download final particle ids");
 }
 
 } // namespace sph
