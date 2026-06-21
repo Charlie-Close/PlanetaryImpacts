@@ -48,7 +48,7 @@ inline constexpr int expansionTerms =
     ((multipoleExpansionPower + 1) * (multipoleExpansionPower + 2) * (multipoleExpansionPower + 3)) / 6;
 inline constexpr int multipolePowerTerms = multipoleExpansionPower + 1;
 inline constexpr int maxUncheckedPointers = 32;
-inline constexpr int maxLocalUncheckedPointers = 256;
+inline constexpr int maxLocalUncheckedPointers = 64;
 inline constexpr int gravityMaxRecursion = 8;
 inline constexpr float maxFloat = 3.402823466e38f;
 

@@ -130,7 +130,13 @@ private:
     void startAsyncOctreeBuild();
     void destroyBuffer(Buffer& buffer);
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-    uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferredFlags = 0) const;
+    void copyBufferBlocking(const Buffer& src, const Buffer& dst, VkDeviceSize size, const char* what);
+    void uploadBuffer(const Buffer& dst, const void* data, VkDeviceSize size, const char* what);
+    void downloadBuffer(const Buffer& src, void* data, VkDeviceSize size, const char* what);
+    uint32_t findMemory(uint32_t typeBits,
+                        VkMemoryPropertyFlags flags,
+                        VkMemoryPropertyFlags preferredFlags = 0,
+                        VkDeviceSize allocationSize = 0) const;
     VkShaderModule shaderModule(const std::string& path) const;
     void check(VkResult result, const char* what) const;
 
