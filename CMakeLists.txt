@@ -101,7 +101,6 @@ if (SPH_VULKAN_BUILD_SHADERS AND GLSLC_EXECUTABLE)
         "(${SPH_MULTIPOLE_EXPANSION_POWER} + 1) * (${SPH_MULTIPOLE_EXPANSION_POWER} + 2) * (${SPH_MULTIPOLE_EXPANSION_POWER} + 3) / 6"
     )
     math(EXPR SPH_N_MULTIPOLE_POWERS "${SPH_MULTIPOLE_EXPANSION_POWER} + 1")
-    sph_extract_param(maxLocalUncheckedPointers SPH_MAX_LOCAL_UNCHECKED_POINTERS)
     sph_extract_param(gravityMaxRecursion SPH_GRAVITY_MAX_RECURSION)
     sph_extract_param(maxFloat SPH_MAX_FLOAT)
     sph_extract_param(cellWidth SPH_CELL_WIDTH)

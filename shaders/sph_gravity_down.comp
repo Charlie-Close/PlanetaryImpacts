@@ -666,11 +666,56 @@ void nonRecursiveScan(Multipole mp, inout Local local, inout int outputPointer, 
     }
 }
 
-void recursiveScan(Multipole mp, inout Local local, int toScan, int treePointer, inout int uncheckedLeaves[MAX_LOCAL_UNCHECKED_POINTERS], inout int nUnchecked) {
+void addUncheckedLeaf(int nodePointer,
+                      int treePointer,
+                      int nTargets,
+                      int targetParticles[8],
+                      vec3 targetPositions[8],
+                      float targetPrevGrav[8],
+                      inout vec3 targetAcc[8],
+                      float curDt) {
+    if (nodePointer == treePointer) return;
+    int np = tree[nodePointer];
+    if (np <= 0 || np > 8) return;
+    int dataPointer = tree[nodePointer + 1];
+    Multipole ump = multipoles[dataPointer];
+    for (int t = 0; t < 8; ++t) {
+        if (t >= nTargets) break;
+        int particle = targetParticles[t];
+        if (particle < 0 || particle >= pc.nParticles) continue;
+        vec3 xi = targetPositions[t];
+        if (m2pAccept(xi, targetPrevGrav[t], ump)) {
+            targetAcc[t] += m2p(ump, xi);
+            continue;
+        }
+        for (int j = nodePointer + 2; j < nodePointer + 2 + np; ++j) {
+            int pj = tree[j];
+            if (pj < 0 || pj >= pc.nParticles || pj == particle) continue;
+            vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
+            vec3 xij = xi - xj;
+            float r = length(xij);
+            if (r == 0.0) continue;
+            float eta = min(smoothingLengths[pj] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
+            targetAcc[t] -= masses[pj] * dphi_dr(xij, eta) * (xij / r);
+        }
+    }
+}
+
+void recursiveScanLeaf(Multipole mp,
+                       inout Local local,
+                       int toScan,
+                       int treePointer,
+                       int nTargets,
+                       int targetParticles[8],
+                       vec3 targetPositions[8],
+                       float targetPrevGrav[8],
+                       inout vec3 targetAcc[8],
+                       float curDt) {
+    if (toScan == treePointer) return;
     bool leaf = tree[toScan] != 0;
-    if (checkAndAddLocal(toScan, mp, local, (nUnchecked >= MAX_LOCAL_UNCHECKED_POINTERS && leaf))) return;
+    if (checkAndAddLocal(toScan, mp, local, false)) return;
     if (leaf) {
-        if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) uncheckedLeaves[nUnchecked++] = toScan;
+        addUncheckedLeaf(toScan, treePointer, nTargets, targetParticles, targetPositions, targetPrevGrav, targetAcc, curDt);
         return;
     }
 
@@ -692,7 +737,7 @@ void recursiveScan(Multipole mp, inout Local local, int toScan, int treePointer,
             continue;
         }
         bool nodeLeaf = tree[nodePointer] != 0;
-        bool forceAccept = (nUnchecked >= MAX_LOCAL_UNCHECKED_POINTERS && nodeLeaf) || (!nodeLeaf && currentDepth == GRAVITY_MAX_RECURSION - 1);
+        bool forceAccept = !nodeLeaf && currentDepth == GRAVITY_MAX_RECURSION - 1;
         if (!checkAndAddLocal(nodePointer, mp, local, forceAccept)) {
             if (!nodeLeaf && currentDepth + 1 < GRAVITY_MAX_RECURSION) {
                 currentDepth++;
@@ -700,7 +745,9 @@ void recursiveScan(Multipole mp, inout Local local, int toScan, int treePointer,
                 ends[currentDepth] = indexes[currentDepth] + 8;
                 continue;
             }
-            if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) uncheckedLeaves[nUnchecked++] = nodePointer;
+            if (nodeLeaf) {
+                addUncheckedLeaf(nodePointer, treePointer, nTargets, targetParticles, targetPositions, targetPrevGrav, targetAcc, curDt);
+            }
         }
         indexes[currentDepth]++;
         while (indexes[currentDepth] == ends[currentDepth] && currentDepth != 0) {
@@ -721,47 +768,51 @@ void l2l(Multipole mp, Local local, int treePointer) {
     }
 }
 
-void localToLeaf(Multipole mp, Local local, int treePointer, int nParticles, float curDt, int uncheckedLeaves[MAX_LOCAL_UNCHECKED_POINTERS], int nUnchecked) {
-    int start = treePointer + 2;
-    int end = start + nParticles;
-    for (int i = start; i < end; ++i) {
-        int particle = tree[i];
+void initLeafTargets(int treePointer,
+                     int nParticles,
+                     float curDt,
+                     out int targetParticles[8],
+                     out vec3 targetPositions[8],
+                     out float targetPrevGrav[8],
+                     out vec3 targetAcc[8]) {
+    for (int t = 0; t < 8; ++t) {
+        if (t < nParticles) {
+            int particle = tree[treePointer + 2 + t];
+            targetParticles[t] = particle;
+            if (particle >= 0 && particle < pc.nParticles) {
+                targetPositions[t] = positions[particle].xyz + 0.5 * curDt * velocities[particle].xyz;
+                targetPrevGrav[t] = gravAbs[particle];
+            } else {
+                targetPositions[t] = vec3(0.0);
+                targetPrevGrav[t] = 0.0;
+            }
+        } else {
+            targetParticles[t] = -1;
+            targetPositions[t] = vec3(0.0);
+            targetPrevGrav[t] = 0.0;
+        }
+        targetAcc[t] = vec3(0.0);
+    }
+}
+
+void localToLeaf(Local local, int nParticles, int targetParticles[8], vec3 targetPositions[8], inout vec3 targetAcc[8]) {
+    for (int t = 0; t < 8; ++t) {
+        if (t >= nParticles) break;
+        int particle = targetParticles[t];
         if (particle < 0 || particle >= pc.nParticles) continue;
-        vec3 xi = positions[particle].xyz + 0.5 * curDt * velocities[particle].xyz;
-        float prevGrav = gravAbs[particle];
-        vec3 acc = l2p(local, xi);
-        for (int j = start; j < end; ++j) {
-            if (i == j) continue;
-            int pj = tree[j];
+        vec3 xi = targetPositions[t];
+        vec3 acc = l2p(local, xi) + targetAcc[t];
+        for (int j = 0; j < 8; ++j) {
+            if (j >= nParticles) break;
+            if (t == j) continue;
+            int pj = targetParticles[j];
             if (pj < 0 || pj >= pc.nParticles) continue;
-            vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
+            vec3 xj = targetPositions[j];
             vec3 xij = xi - xj;
             float r = length(xij);
             if (r == 0.0) continue;
             float eta = min(smoothingLengths[pj] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
             acc -= masses[pj] * dphi_dr(xij, eta) * (xij / r);
-        }
-        for (int u = 0; u < nUnchecked; ++u) {
-            int nodePointer = uncheckedLeaves[u];
-            if (nodePointer < 0) break;
-            int dataPointer = tree[nodePointer + 1];
-            Multipole ump = multipoles[dataPointer];
-            if (m2pAccept(xi, prevGrav, ump)) {
-                acc += m2p(ump, xi);
-                continue;
-            }
-            int np = tree[nodePointer];
-            if (np <= 0 || np > 8) continue;
-            for (int j = nodePointer + 2; j < nodePointer + 2 + np; ++j) {
-                int pj = tree[j];
-                if (pj < 0 || pj >= pc.nParticles) continue;
-                vec3 xj = positions[pj].xyz + 0.5 * curDt * velocities[pj].xyz;
-                vec3 xij = xi - xj;
-                float r = length(xij);
-                if (r == 0.0) continue;
-                float eta = min(smoothingLengths[pj] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
-                acc -= masses[pj] * dphi_dr(xij, eta) * (xij / r);
-            }
         }
         vec3 grav = pc.gravityG * acc;
         float gnorm = length(grav);
@@ -795,28 +846,38 @@ void main() {
     int nParticles = tree[treePointer];
     if (nParticles < 0 || nParticles > 8) return;
 
-    int outputPointer = int(i) * pc.stride;
-    int maxOutputPointer = outputPointer + pc.stride;
-    if (nParticles == 0 && outputPointer < maxOutputPointer) {
-        writeUnchecked(outputPointer, treePointer);
-        outputPointer++;
-    }
-
     uint parentIndex = parentIndexes[dataPointer];
     int startScan = int(parentIndex) * pc.uncheckedParentStride;
     int endScan = startScan + pc.uncheckedParentStride;
-    int localUncheckedPointers[MAX_LOCAL_UNCHECKED_POINTERS];
-    int nUnchecked = 0;
+    float curDt = pc.minDt * float(pc.stepTicks);
+    if (nParticles == 0) {
+        int outputPointer = int(i) * pc.stride;
+        int maxOutputPointer = outputPointer + pc.stride;
+        if (outputPointer < maxOutputPointer) {
+            writeUnchecked(outputPointer, treePointer);
+            outputPointer++;
+        }
+        for (int s = startScan; s < endScan; ++s) {
+            int toScan = readUnchecked(s);
+            if (toScan == -1) break;
+            if (toScan < 0) continue;
+            nonRecursiveScan(mp, local, outputPointer, maxOutputPointer, toScan, treePointer);
+        }
+        if (outputPointer < maxOutputPointer) writeUnchecked(outputPointer, -1);
+        l2l(mp, local, treePointer);
+        return;
+    }
+
+    int targetParticles[8];
+    vec3 targetPositions[8];
+    float targetPrevGrav[8];
+    vec3 targetAcc[8];
+    initLeafTargets(treePointer, nParticles, curDt, targetParticles, targetPositions, targetPrevGrav, targetAcc);
     for (int s = startScan; s < endScan; ++s) {
         int toScan = readUnchecked(s);
         if (toScan == -1) break;
         if (toScan < 0) continue;
-        if (nParticles != 0) recursiveScan(mp, local, toScan, treePointer, localUncheckedPointers, nUnchecked);
-        else nonRecursiveScan(mp, local, outputPointer, maxOutputPointer, toScan, treePointer);
+        recursiveScanLeaf(mp, local, toScan, treePointer, nParticles, targetParticles, targetPositions, targetPrevGrav, targetAcc, curDt);
     }
-    if (outputPointer < maxOutputPointer && nParticles == 0) writeUnchecked(outputPointer, -1);
-    if (nUnchecked < MAX_LOCAL_UNCHECKED_POINTERS) localUncheckedPointers[nUnchecked] = -1;
-
-    if (nParticles == 0) l2l(mp, local, treePointer);
-    else localToLeaf(mp, local, treePointer, nParticles, pc.minDt * float(pc.stepTicks), localUncheckedPointers, nUnchecked);
+    localToLeaf(local, nParticles, targetParticles, targetPositions, targetAcc);
 }
