@@ -90,6 +90,82 @@ std::array<float, 16> lookAt4x4(Vec3 pos, Vec3 forward, Vec3 up) {
     return multiply4x4(rotation, translation);
 }
 
+float gravityDphiDr(Vec3 xij, float eta) {
+    const float r2 = lengthSquared(xij);
+    if (eta <= 0.0f) return 1.0f / std::max(r2, 1e-30f);
+    const float etaInv = 1.0f / eta;
+    const float r = std::sqrt(r2);
+    const float q = r * etaInv;
+    if (q <= 1.0f) {
+        return etaInv * etaInv * ((4.0f / 3.0f) * q - (6.0f / 5.0f) * q * q * q + 0.5f * q * q * q * q);
+    }
+    if (q <= 2.0f) {
+        const float qInv = 1.0f / q;
+        return etaInv * etaInv * ((8.0f / 3.0f) * q - 3.0f * q * q + (6.0f / 5.0f) * q * q * q -
+                                  (1.0f / 6.0f) * q * q * q * q - (1.0f / 15.0f) * qInv * qInv);
+    }
+    return 1.0f / std::max(r2, 1e-30f);
+}
+
+std::vector<float> estimateInitialGravityMagnitudes(const DataSet& data, const std::vector<uint32_t>& alive) {
+    constexpr size_t kSampleCount = 64;
+    const size_t n = data.positions.size();
+    std::vector<float> out(n, 0.0f);
+    std::vector<size_t> aliveIndices;
+    aliveIndices.reserve(n);
+    double totalMass = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!alive.empty() && alive[i] == 0u) continue;
+        aliveIndices.push_back(i);
+        totalMass += static_cast<double>(data.masses[i]);
+    }
+    if (aliveIndices.empty() || totalMass <= 0.0) return out;
+
+    const size_t sampleCount = std::min(kSampleCount, aliveIndices.size());
+    std::vector<size_t> sampleIndices;
+    sampleIndices.reserve(sampleCount);
+    double sampleMass = 0.0;
+    for (size_t s = 0; s < sampleCount; ++s) {
+        const size_t aliveOrdinal = (s * aliveIndices.size()) / sampleCount;
+        const size_t source = aliveIndices[aliveOrdinal];
+        sampleIndices.push_back(source);
+        sampleMass += static_cast<double>(data.masses[source]);
+    }
+    const float sampleScale = sampleMass > 0.0 ? static_cast<float>(totalMass / sampleMass) : 1.0f;
+
+    for (size_t i : aliveIndices) {
+        Vec3 acc{};
+        const Vec3 xi = data.positions[i];
+        for (size_t j : sampleIndices) {
+            if (i == j) continue;
+            const Vec3 xij = xi - data.positions[j];
+            const float r = length(xij);
+            if (r == 0.0f) continue;
+            const float eta = std::min(data.smoothingLengths[j] * params::gamma * params::plumberEquivalent,
+                                       params::gravitySmoothingLength);
+            acc -= xij * ((data.masses[j] * gravityDphiDr(xij, eta)) / r);
+        }
+        out[i] = length(acc) * sampleScale;
+    }
+
+    std::vector<float> positive;
+    positive.reserve(aliveIndices.size());
+    for (size_t i : aliveIndices) {
+        if (std::isfinite(out[i]) && out[i] > 0.0f) positive.push_back(out[i]);
+    }
+    if (positive.empty()) {
+        std::fill(out.begin(), out.end(), 1.0f);
+        return out;
+    }
+    const auto medianIt = positive.begin() + static_cast<std::ptrdiff_t>(positive.size() / 2);
+    std::nth_element(positive.begin(), medianIt, positive.end());
+    const float floor = std::max(*medianIt * 0.05f, 1e-6f);
+    for (size_t i : aliveIndices) {
+        if (!std::isfinite(out[i]) || out[i] < floor) out[i] = floor;
+    }
+    return out;
+}
+
 } // namespace
 
 VulkanSimulation::VulkanSimulation(Simulator& simulator) : simulator_(simulator) {
@@ -595,12 +671,13 @@ void VulkanSimulation::uploadInitialState() {
         Vec3 translated = data.positions[i] - makeVec3(params::boxCenter, params::boxCenter, params::boxCenter);
         aliveHost_[i] = (std::abs(translated.x) <= params::boxSize && std::abs(translated.y) <= params::boxSize && std::abs(translated.z) <= params::boxSize) ? 1u : 0u;
     }
+    std::vector<float> initialGravAbs = estimateInitialGravityMagnitudes(data, aliveHost_);
     uploadVector(alive_, aliveHost_, "upload alive flags");
     uploadVector(accelerations_, zeros3, "upload accelerations");
     uploadVector(gravAccelerations_, zeros3, "upload gravity accelerations");
     uploadVector(dInternalEnergy_, zeros, "upload internal energy derivatives");
     uploadVector(dhDt_, zeros, "upload smoothing length derivatives");
-    uploadVector(gravAbs_, zeros, "upload gravity magnitudes");
+    uploadVector(gravAbs_, initialGravAbs, "upload gravity magnitudes");
     uploadVector(accelerations1_, zeros3, "upload acceleration scratch");
     uploadVector(dInternalEnergy1_, zeros, "upload internal energy derivative scratch");
     std::vector<float> ones(particleCount_, 1.0f);
