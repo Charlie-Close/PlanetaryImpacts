@@ -77,12 +77,12 @@ layout(std430, binding = 5) readonly buffer H { float smoothingLengths[]; };
 layout(std430, binding = 9) readonly buffer Alive { uint alive[]; };
 layout(std430, binding = 11) buffer GravAccelerations { vec4 gravAccelerations[]; };
 layout(std430, binding = 14) readonly buffer Tree { int tree[]; };
-layout(std430, binding = 15) readonly buffer Multipoles { Multipole multipoles[]; };
-layout(std430, binding = 16) buffer Locals { Local locals[]; };
+layout(std430, binding = 15) readonly buffer Multipoles { Multipole multipoles[]; } multipoleChunks[STORAGE_BUFFER_CHUNKS];
+layout(std430, binding = 16) buffer Locals { Local locals[]; } localChunks[STORAGE_BUFFER_CHUNKS];
 layout(std430, binding = 17) readonly buffer ParentIndexes { uint parentIndexes[]; };
 layout(std430, binding = 18) readonly buffer TreeLevel { int treeLevel[]; };
-layout(std430, binding = 19) buffer LocalGravA { int localGravA[]; };
-layout(std430, binding = 20) buffer LocalGravB { int localGravB[]; };
+layout(std430, binding = 19) buffer LocalGravA { int localGravA[]; } localGravAChunks[STORAGE_BUFFER_CHUNKS];
+layout(std430, binding = 20) buffer LocalGravB { int localGravB[]; } localGravBChunks[STORAGE_BUFFER_CHUNKS];
 layout(std430, binding = 21) buffer GravAbs { float gravAbs[]; };
 layout(std430, binding = 43) buffer StepTicks { int stepTicks[]; };
 layout(std430, binding = 45) buffer GravityStepTicks { int gravityStepTicks[]; };
@@ -104,7 +104,23 @@ layout(push_constant) uniform PushConstants {
     int uncheckedParentStride;
     int gravityLevelParity;
     int dispatchOffset;
+    int multipoleChunkElements;
+    int localChunkElements;
+    int localGravChunkElements;
 } pc;
+
+int chunkIndex(int index, int elementsPerChunk) {
+    return index / elementsPerChunk;
+}
+
+int chunkOffset(int index, int elementsPerChunk) {
+    return index - chunkIndex(index, elementsPerChunk) * elementsPerChunk;
+}
+
+#define MP(index) multipoleChunks[chunkIndex((index), pc.multipoleChunkElements)].multipoles[chunkOffset((index), pc.multipoleChunkElements)]
+#define LOCAL(index) localChunks[chunkIndex((index), pc.localChunkElements)].locals[chunkOffset((index), pc.localChunkElements)]
+#define LGA(index) localGravAChunks[chunkIndex((index), pc.localGravChunkElements)].localGravA[chunkOffset((index), pc.localGravChunkElements)]
+#define LGB(index) localGravBChunks[chunkIndex((index), pc.localGravChunkElements)].localGravB[chunkOffset((index), pc.localGravChunkElements)]
 
 float integer_powf(float x, int n) {
     if (n == 0) return 1.0;
@@ -619,7 +635,7 @@ Local transformLocal(Local local, vec3 r) {
 
 bool checkAndAddLocal(int toScan, Multipole mp, inout Local local, bool forceAccept) {
     int nodeData = tree[toScan + 1];
-    Multipole nodeMp = multipoles[nodeData];
+    Multipole nodeMp = MP(nodeData);
     if (forceAccept || m2lAccept(mp, nodeMp)) {
         m2l(nodeMp, local);
         return true;
@@ -628,12 +644,12 @@ bool checkAndAddLocal(int toScan, Multipole mp, inout Local local, bool forceAcc
 }
 
 int readUnchecked(int idx) {
-    return pc.gravityLevelParity == 0 ? localGravA[idx] : localGravB[idx];
+    return pc.gravityLevelParity == 0 ? LGA(idx) : LGB(idx);
 }
 
 void writeUnchecked(int idx, int value) {
-    if (pc.gravityLevelParity == 0) localGravB[idx] = value;
-    else localGravA[idx] = value;
+    if (pc.gravityLevelParity == 0) LGB(idx) = value;
+    else LGA(idx) = value;
 }
 
 void zeroFirstBranches() {
@@ -641,8 +657,8 @@ void zeroFirstBranches() {
         int nodePointer = tree[i];
         if (nodePointer == -1) continue;
         int nodeData = tree[nodePointer + 1];
-        locals[nodeData].pos = vec4(multipoles[nodeData].pos.xyz, 0.0);
-        for (int j = 0; j < N_EXPANSION_TERMS; ++j) locals[nodeData].expansion[j] = 0.0;
+        LOCAL(nodeData).pos = vec4(MP(nodeData).pos.xyz, 0.0);
+        for (int j = 0; j < N_EXPANSION_TERMS; ++j) LOCAL(nodeData).expansion[j] = 0.0;
     }
     writeUnchecked(0, 0);
     writeUnchecked(1, -1);
@@ -678,7 +694,7 @@ void addUncheckedLeaf(int nodePointer,
     int np = tree[nodePointer];
     if (np <= 0 || np > 8) return;
     int dataPointer = tree[nodePointer + 1];
-    Multipole ump = multipoles[dataPointer];
+    Multipole ump = MP(dataPointer);
     for (int t = 0; t < 8; ++t) {
         if (t >= nTargets) break;
         int particle = targetParticles[t];
@@ -762,9 +778,9 @@ void l2l(Multipole mp, Local local, int treePointer) {
         int nodePointer = tree[j];
         if (nodePointer == -1) continue;
         int nodeData = tree[nodePointer + 1];
-        Multipole nodeMp = multipoles[nodeData];
+        Multipole nodeMp = MP(nodeData);
         vec3 r = nodeMp.pos.xyz - local.pos.xyz;
-        locals[nodeData] = transformLocal(local, r);
+        LOCAL(nodeData) = transformLocal(local, r);
     }
 }
 
@@ -841,8 +857,8 @@ void main() {
     }
 
     int dataPointer = tree[treePointer + 1];
-    Multipole mp = multipoles[dataPointer];
-    Local local = locals[dataPointer];
+    Multipole mp = MP(dataPointer);
+    Local local = LOCAL(dataPointer);
     int nParticles = tree[treePointer];
     if (nParticles < 0 || nParticles > 8) return;
 

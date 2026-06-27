@@ -63,8 +63,8 @@ layout(std430, binding = 1) readonly buffer Velocities { vec4 velocities[]; };
 layout(std430, binding = 4) readonly buffer Masses { float masses[]; };
 layout(std430, binding = 5) readonly buffer H { float smoothingLengths[]; };
 layout(std430, binding = 14) readonly buffer Tree { int tree[]; };
-layout(std430, binding = 15) buffer Multipoles { Multipole multipoles[]; };
-layout(std430, binding = 16) buffer Locals { Local locals[]; };
+layout(std430, binding = 15) buffer Multipoles { Multipole multipoles[]; } multipoleChunks[STORAGE_BUFFER_CHUNKS];
+layout(std430, binding = 16) buffer Locals { Local locals[]; } localChunks[STORAGE_BUFFER_CHUNKS];
 layout(std430, binding = 17) buffer ParentIndexes { uint parentIndexes[]; };
 layout(std430, binding = 18) readonly buffer TreeLevel { int treeLevel[]; };
 layout(std430, binding = 21) readonly buffer GravAbs { float gravAbs[]; };
@@ -83,28 +83,42 @@ layout(push_constant) uniform PushConstants {
     int stride;
     int sortIteration;
     int cellTableSize;
-    int pad0;
-    int pad1;
-    int pad2;
+    int uncheckedParentStride;
+    int gravityLevelParity;
+    int dispatchOffset;
+    int multipoleChunkElements;
+    int localChunkElements;
+    int localGravChunkElements;
 } pc;
 
+int chunkIndex(int index, int elementsPerChunk) {
+    return index / elementsPerChunk;
+}
+
+int chunkOffset(int index, int elementsPerChunk) {
+    return index - chunkIndex(index, elementsPerChunk) * elementsPerChunk;
+}
+
+#define MP(index) multipoleChunks[chunkIndex((index), pc.multipoleChunkElements)].multipoles[chunkOffset((index), pc.multipoleChunkElements)]
+#define LOCAL(index) localChunks[chunkIndex((index), pc.localChunkElements)].locals[chunkOffset((index), pc.localChunkElements)]
+
 void clearMultipole(int dataPointer) {
-    multipoles[dataPointer].pos = vec4(0.0);
-    multipoles[dataPointer].minv = vec4(MAX_FLOAT);
-    multipoles[dataPointer].maxv = vec4(-MAX_FLOAT);
-    multipoles[dataPointer].size = 0.0;
-    for (int i = 0; i < N_EXPANSION_TERMS; ++i) multipoles[dataPointer].expansion[i] = 0.0;
-    for (int i = 0; i < N_MULTIPOLE_POWERS; ++i) multipoles[dataPointer].power[i] = 0.0;
-    multipoles[dataPointer].minGrav = MAX_FLOAT;
-    multipoles[dataPointer].eta = 0.0;
-    multipoles[dataPointer].pad0 = 0.0;
-    multipoles[dataPointer].pad1 = 0.0;
+    MP(dataPointer).pos = vec4(0.0);
+    MP(dataPointer).minv = vec4(MAX_FLOAT);
+    MP(dataPointer).maxv = vec4(-MAX_FLOAT);
+    MP(dataPointer).size = 0.0;
+    for (int i = 0; i < N_EXPANSION_TERMS; ++i) MP(dataPointer).expansion[i] = 0.0;
+    for (int i = 0; i < N_MULTIPOLE_POWERS; ++i) MP(dataPointer).power[i] = 0.0;
+    MP(dataPointer).minGrav = MAX_FLOAT;
+    MP(dataPointer).eta = 0.0;
+    MP(dataPointer).pad0 = 0.0;
+    MP(dataPointer).pad1 = 0.0;
 }
 
 void addPowers(int dataPointer) {
-    Multipole mp = multipoles[dataPointer];
-    multipoles[dataPointer].power[0] = mp.expansion[M];
-    multipoles[dataPointer].power[1] = 0.0;
+    Multipole mp = MP(dataPointer);
+    MP(dataPointer).power[0] = mp.expansion[M];
+    MP(dataPointer).power[1] = 0.0;
 #if MULTIPOLE_EXPANSION_POWER > 1
     float p2 = mp.expansion[ZZ] * mp.expansion[ZZ];
     p2 += 0.5 * mp.expansion[YZ] * mp.expansion[YZ];
@@ -112,7 +126,7 @@ void addPowers(int dataPointer) {
     p2 += 0.5 * mp.expansion[XZ] * mp.expansion[XZ];
     p2 += 0.5 * mp.expansion[XY] * mp.expansion[XY];
     p2 += 0.5 * mp.expansion[XX] * mp.expansion[XX];
-    multipoles[dataPointer].power[2] = sqrt(max(p2, 0.0));
+    MP(dataPointer).power[2] = sqrt(max(p2, 0.0));
 #endif
 
 #if MULTIPOLE_EXPANSION_POWER > 2
@@ -126,7 +140,7 @@ void addPowers(int dataPointer) {
     p3 += (1.0 / 3.0) * mp.expansion[XXZ] * mp.expansion[XXZ];
     p3 += (1.0 / 3.0) * mp.expansion[XXY] * mp.expansion[XXY];
     p3 += mp.expansion[XXX] * mp.expansion[XXX];
-    multipoles[dataPointer].power[3] = sqrt(max(p3, 0.0));
+    MP(dataPointer).power[3] = sqrt(max(p3, 0.0));
 #endif
 
 #if MULTIPOLE_EXPANSION_POWER > 3
@@ -145,7 +159,7 @@ void addPowers(int dataPointer) {
     p4 += 0.25 * mp.expansion[XXXZ] * mp.expansion[XXXZ];
     p4 += 0.25 * mp.expansion[XXXY] * mp.expansion[XXXY];
     p4 += mp.expansion[XXXX] * mp.expansion[XXXX];
-    multipoles[dataPointer].power[4] = sqrt(max(p4, 0.0));
+    MP(dataPointer).power[4] = sqrt(max(p4, 0.0));
 #endif
 }
 
@@ -160,101 +174,101 @@ void accumulateP2M(int treePointer, int dataPointer, float fdt) {
         float pmass = masses[p];
         vec3 ppos = positions[p].xyz + 0.5 * fdt * velocities[p].xyz;
         float peta = min(smoothingLengths[p] * GAMMA * PLUMBER_EQUIVALENT, pc.gravitySoftening);
-        multipoles[dataPointer].maxv.xyz = max(multipoles[dataPointer].maxv.xyz, ppos);
-        multipoles[dataPointer].minv.xyz = min(multipoles[dataPointer].minv.xyz, ppos);
-        multipoles[dataPointer].eta = max(multipoles[dataPointer].eta, peta);
-        multipoles[dataPointer].expansion[M] += pmass;
-        multipoles[dataPointer].pos.xyz += ppos * pmass;
-        multipoles[dataPointer].minGrav = min(multipoles[dataPointer].minGrav, gravAbs[p]);
+        MP(dataPointer).maxv.xyz = max(MP(dataPointer).maxv.xyz, ppos);
+        MP(dataPointer).minv.xyz = min(MP(dataPointer).minv.xyz, ppos);
+        MP(dataPointer).eta = max(MP(dataPointer).eta, peta);
+        MP(dataPointer).expansion[M] += pmass;
+        MP(dataPointer).pos.xyz += ppos * pmass;
+        MP(dataPointer).minGrav = min(MP(dataPointer).minGrav, gravAbs[p]);
     }
 
-    float mass = multipoles[dataPointer].expansion[M];
-    multipoles[dataPointer].pos.xyz /= max(mass, 1e-30);
+    float mass = MP(dataPointer).expansion[M];
+    MP(dataPointer).pos.xyz /= max(mass, 1e-30);
 
     for (int i = start; i < end; ++i) {
         int p = tree[i];
         if (p < 0 || p >= pc.nParticles) continue;
         float pmass = masses[p];
         vec3 ppos = positions[p].xyz + 0.5 * fdt * velocities[p].xyz;
-        vec3 r = ppos - multipoles[dataPointer].pos.xyz;
+        vec3 r = ppos - MP(dataPointer).pos.xyz;
 
-        multipoles[dataPointer].expansion[X] -= r.x * pmass;
-        multipoles[dataPointer].expansion[Y] -= r.y * pmass;
-        multipoles[dataPointer].expansion[Z] -= r.z * pmass;
+        MP(dataPointer).expansion[X] -= r.x * pmass;
+        MP(dataPointer).expansion[Y] -= r.y * pmass;
+        MP(dataPointer).expansion[Z] -= r.z * pmass;
 
 #if MULTIPOLE_EXPANSION_POWER > 1
-        multipoles[dataPointer].expansion[XX] += pmass * r.x * r.x;
-        multipoles[dataPointer].expansion[XY] += pmass * r.x * r.y;
-        multipoles[dataPointer].expansion[XZ] += pmass * r.x * r.z;
-        multipoles[dataPointer].expansion[YY] += pmass * r.y * r.y;
-        multipoles[dataPointer].expansion[YZ] += pmass * r.y * r.z;
-        multipoles[dataPointer].expansion[ZZ] += pmass * r.z * r.z;
+        MP(dataPointer).expansion[XX] += pmass * r.x * r.x;
+        MP(dataPointer).expansion[XY] += pmass * r.x * r.y;
+        MP(dataPointer).expansion[XZ] += pmass * r.x * r.z;
+        MP(dataPointer).expansion[YY] += pmass * r.y * r.y;
+        MP(dataPointer).expansion[YZ] += pmass * r.y * r.z;
+        MP(dataPointer).expansion[ZZ] += pmass * r.z * r.z;
 #endif
 
 #if MULTIPOLE_EXPANSION_POWER > 2
-        multipoles[dataPointer].expansion[XXX] -= pmass * r.x * r.x * r.x;
-        multipoles[dataPointer].expansion[XXY] -= pmass * r.x * r.x * r.y;
-        multipoles[dataPointer].expansion[XXZ] -= pmass * r.x * r.x * r.z;
-        multipoles[dataPointer].expansion[XYY] -= pmass * r.x * r.y * r.y;
-        multipoles[dataPointer].expansion[XYZ] -= pmass * r.x * r.y * r.z;
-        multipoles[dataPointer].expansion[XZZ] -= pmass * r.x * r.z * r.z;
-        multipoles[dataPointer].expansion[YYY] -= pmass * r.y * r.y * r.y;
-        multipoles[dataPointer].expansion[YYZ] -= pmass * r.y * r.y * r.z;
-        multipoles[dataPointer].expansion[YZZ] -= pmass * r.y * r.z * r.z;
-        multipoles[dataPointer].expansion[ZZZ] -= pmass * r.z * r.z * r.z;
+        MP(dataPointer).expansion[XXX] -= pmass * r.x * r.x * r.x;
+        MP(dataPointer).expansion[XXY] -= pmass * r.x * r.x * r.y;
+        MP(dataPointer).expansion[XXZ] -= pmass * r.x * r.x * r.z;
+        MP(dataPointer).expansion[XYY] -= pmass * r.x * r.y * r.y;
+        MP(dataPointer).expansion[XYZ] -= pmass * r.x * r.y * r.z;
+        MP(dataPointer).expansion[XZZ] -= pmass * r.x * r.z * r.z;
+        MP(dataPointer).expansion[YYY] -= pmass * r.y * r.y * r.y;
+        MP(dataPointer).expansion[YYZ] -= pmass * r.y * r.y * r.z;
+        MP(dataPointer).expansion[YZZ] -= pmass * r.y * r.z * r.z;
+        MP(dataPointer).expansion[ZZZ] -= pmass * r.z * r.z * r.z;
 #endif
 
 #if MULTIPOLE_EXPANSION_POWER > 3
-        multipoles[dataPointer].expansion[XXXX] += pmass * r.x * r.x * r.x * r.x;
-        multipoles[dataPointer].expansion[XXXY] += pmass * r.x * r.x * r.x * r.y;
-        multipoles[dataPointer].expansion[XXXZ] += pmass * r.x * r.x * r.x * r.z;
-        multipoles[dataPointer].expansion[XXYY] += pmass * r.x * r.x * r.y * r.y;
-        multipoles[dataPointer].expansion[XXYZ] += pmass * r.x * r.x * r.y * r.z;
-        multipoles[dataPointer].expansion[XXZZ] += pmass * r.x * r.x * r.z * r.z;
-        multipoles[dataPointer].expansion[XYYY] += pmass * r.x * r.y * r.y * r.y;
-        multipoles[dataPointer].expansion[XYYZ] += pmass * r.x * r.y * r.y * r.z;
-        multipoles[dataPointer].expansion[XYZZ] += pmass * r.x * r.y * r.z * r.z;
-        multipoles[dataPointer].expansion[XZZZ] += pmass * r.x * r.z * r.z * r.z;
-        multipoles[dataPointer].expansion[YYYY] += pmass * r.y * r.y * r.y * r.y;
-        multipoles[dataPointer].expansion[YYYZ] += pmass * r.y * r.y * r.y * r.z;
-        multipoles[dataPointer].expansion[YYZZ] += pmass * r.y * r.y * r.z * r.z;
-        multipoles[dataPointer].expansion[YZZZ] += pmass * r.y * r.z * r.z * r.z;
-        multipoles[dataPointer].expansion[ZZZZ] += pmass * r.z * r.z * r.z * r.z;
+        MP(dataPointer).expansion[XXXX] += pmass * r.x * r.x * r.x * r.x;
+        MP(dataPointer).expansion[XXXY] += pmass * r.x * r.x * r.x * r.y;
+        MP(dataPointer).expansion[XXXZ] += pmass * r.x * r.x * r.x * r.z;
+        MP(dataPointer).expansion[XXYY] += pmass * r.x * r.x * r.y * r.y;
+        MP(dataPointer).expansion[XXYZ] += pmass * r.x * r.x * r.y * r.z;
+        MP(dataPointer).expansion[XXZZ] += pmass * r.x * r.x * r.z * r.z;
+        MP(dataPointer).expansion[XYYY] += pmass * r.x * r.y * r.y * r.y;
+        MP(dataPointer).expansion[XYYZ] += pmass * r.x * r.y * r.y * r.z;
+        MP(dataPointer).expansion[XYZZ] += pmass * r.x * r.y * r.z * r.z;
+        MP(dataPointer).expansion[XZZZ] += pmass * r.x * r.z * r.z * r.z;
+        MP(dataPointer).expansion[YYYY] += pmass * r.y * r.y * r.y * r.y;
+        MP(dataPointer).expansion[YYYZ] += pmass * r.y * r.y * r.y * r.z;
+        MP(dataPointer).expansion[YYZZ] += pmass * r.y * r.y * r.z * r.z;
+        MP(dataPointer).expansion[YZZZ] += pmass * r.y * r.z * r.z * r.z;
+        MP(dataPointer).expansion[ZZZZ] += pmass * r.z * r.z * r.z * r.z;
 #endif
     }
 
 #if MULTIPOLE_EXPANSION_POWER > 1
-    multipoles[dataPointer].expansion[XX] *= 0.5;
-    multipoles[dataPointer].expansion[YY] *= 0.5;
-    multipoles[dataPointer].expansion[ZZ] *= 0.5;
+    MP(dataPointer).expansion[XX] *= 0.5;
+    MP(dataPointer).expansion[YY] *= 0.5;
+    MP(dataPointer).expansion[ZZ] *= 0.5;
 #endif
 #if MULTIPOLE_EXPANSION_POWER > 2
-    multipoles[dataPointer].expansion[XXX] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[YYY] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[ZZZ] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[XXY] *= 0.5;
-    multipoles[dataPointer].expansion[XXZ] *= 0.5;
-    multipoles[dataPointer].expansion[XYY] *= 0.5;
-    multipoles[dataPointer].expansion[XZZ] *= 0.5;
-    multipoles[dataPointer].expansion[YYZ] *= 0.5;
-    multipoles[dataPointer].expansion[YZZ] *= 0.5;
+    MP(dataPointer).expansion[XXX] *= 0.1666666666666667;
+    MP(dataPointer).expansion[YYY] *= 0.1666666666666667;
+    MP(dataPointer).expansion[ZZZ] *= 0.1666666666666667;
+    MP(dataPointer).expansion[XXY] *= 0.5;
+    MP(dataPointer).expansion[XXZ] *= 0.5;
+    MP(dataPointer).expansion[XYY] *= 0.5;
+    MP(dataPointer).expansion[XZZ] *= 0.5;
+    MP(dataPointer).expansion[YYZ] *= 0.5;
+    MP(dataPointer).expansion[YZZ] *= 0.5;
 #endif
 #if MULTIPOLE_EXPANSION_POWER > 3
-    multipoles[dataPointer].expansion[XXXX] *= 0.041666666666666667;
-    multipoles[dataPointer].expansion[YYYY] *= 0.041666666666666667;
-    multipoles[dataPointer].expansion[ZZZZ] *= 0.041666666666666667;
-    multipoles[dataPointer].expansion[XXXY] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[XXXZ] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[XYYY] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[XZZZ] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[YYYZ] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[YZZZ] *= 0.1666666666666667;
-    multipoles[dataPointer].expansion[XXYY] *= 0.25;
-    multipoles[dataPointer].expansion[XXZZ] *= 0.25;
-    multipoles[dataPointer].expansion[YYZZ] *= 0.25;
-    multipoles[dataPointer].expansion[XXYZ] *= 0.5;
-    multipoles[dataPointer].expansion[XYYZ] *= 0.5;
-    multipoles[dataPointer].expansion[XYZZ] *= 0.5;
+    MP(dataPointer).expansion[XXXX] *= 0.041666666666666667;
+    MP(dataPointer).expansion[YYYY] *= 0.041666666666666667;
+    MP(dataPointer).expansion[ZZZZ] *= 0.041666666666666667;
+    MP(dataPointer).expansion[XXXY] *= 0.1666666666666667;
+    MP(dataPointer).expansion[XXXZ] *= 0.1666666666666667;
+    MP(dataPointer).expansion[XYYY] *= 0.1666666666666667;
+    MP(dataPointer).expansion[XZZZ] *= 0.1666666666666667;
+    MP(dataPointer).expansion[YYYZ] *= 0.1666666666666667;
+    MP(dataPointer).expansion[YZZZ] *= 0.1666666666666667;
+    MP(dataPointer).expansion[XXYY] *= 0.25;
+    MP(dataPointer).expansion[XXZZ] *= 0.25;
+    MP(dataPointer).expansion[YYZZ] *= 0.25;
+    MP(dataPointer).expansion[XXYZ] *= 0.5;
+    MP(dataPointer).expansion[XYYZ] *= 0.5;
+    MP(dataPointer).expansion[XYZZ] *= 0.5;
 #endif
 }
 
@@ -374,25 +388,25 @@ void accumulateM2M(int treePointer, int dataPointer, uint levelIndex) {
         if (childPointer == -1) continue;
         int childData = tree[childPointer + 1];
         parentIndexes[childData] = levelIndex;
-        Multipole child = multipoles[childData];
-        multipoles[dataPointer].minGrav = min(child.minGrav, multipoles[dataPointer].minGrav);
+        Multipole child = MP(childData);
+        MP(dataPointer).minGrav = min(child.minGrav, MP(dataPointer).minGrav);
         mass += child.expansion[M];
-        multipoles[dataPointer].pos.xyz += child.pos.xyz * child.expansion[M];
-        multipoles[dataPointer].eta = max(multipoles[dataPointer].eta, child.eta);
-        multipoles[dataPointer].maxv.xyz = max(multipoles[dataPointer].maxv.xyz, child.maxv.xyz);
-        multipoles[dataPointer].minv.xyz = min(multipoles[dataPointer].minv.xyz, child.minv.xyz);
+        MP(dataPointer).pos.xyz += child.pos.xyz * child.expansion[M];
+        MP(dataPointer).eta = max(MP(dataPointer).eta, child.eta);
+        MP(dataPointer).maxv.xyz = max(MP(dataPointer).maxv.xyz, child.maxv.xyz);
+        MP(dataPointer).minv.xyz = min(MP(dataPointer).minv.xyz, child.minv.xyz);
     }
 
-    multipoles[dataPointer].pos.xyz /= max(mass, 1e-30);
+    MP(dataPointer).pos.xyz /= max(mass, 1e-30);
 
     for (int c = 0; c < 8; ++c) {
         int childPointer = tree[treePointer + 2 + c];
         if (childPointer == -1) continue;
         int childData = tree[childPointer + 1];
-        Multipole child = multipoles[childData];
-        vec3 r = multipoles[dataPointer].pos.xyz - child.pos.xyz;
+        Multipole child = MP(childData);
+        vec3 r = MP(dataPointer).pos.xyz - child.pos.xyz;
         for (int j = 0; j < N_EXPANSION_TERMS; ++j) {
-            multipoles[dataPointer].expansion[j] += transformedExpansion(child, r, j);
+            MP(dataPointer).expansion[j] += transformedExpansion(child, r, j);
         }
     }
 }
@@ -417,8 +431,8 @@ void main() {
         return;
     }
 
-    vec3 radius = max(abs(multipoles[dataPointer].maxv.xyz - multipoles[dataPointer].pos.xyz),
-                      abs(multipoles[dataPointer].minv.xyz - multipoles[dataPointer].pos.xyz));
-    multipoles[dataPointer].size = length(radius);
+    vec3 radius = max(abs(MP(dataPointer).maxv.xyz - MP(dataPointer).pos.xyz),
+                      abs(MP(dataPointer).minv.xyz - MP(dataPointer).pos.xyz));
+    MP(dataPointer).size = length(radius);
     addPowers(dataPointer);
 }

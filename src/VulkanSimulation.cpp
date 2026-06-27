@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,11 @@ namespace sph {
 namespace {
 
 constexpr uint32_t kWorkgroupSize = 256;
+constexpr uint32_t kSimulationBindingCount = 76;
+constexpr uint32_t kMaxChunkedStorageBuffers = 16;
+constexpr uint32_t kChunkedStorageBindingCount = 4;
+constexpr uint32_t kSimulationDescriptorCount =
+    kSimulationBindingCount + kChunkedStorageBindingCount * (kMaxChunkedStorageBuffers - 1);
 constexpr bool kTraceSimulationPasses = false;
 constexpr float kInitialGravityMagnitudeEstimate = 1.0f;
 
@@ -164,12 +170,12 @@ VulkanSimulation::~VulkanSimulation() {
     destroyBuffer(gravAccelerations_);
     destroyBuffer(accelerations_);
     destroyBuffer(gravAbs_);
-    destroyBuffer(localGravB_);
-    destroyBuffer(localGravA_);
+    destroyChunkedBuffer(localGravB_);
+    destroyChunkedBuffer(localGravA_);
     destroyBuffer(treeLevel_);
     destroyBuffer(parentIndexes_);
-    destroyBuffer(locals_);
-    destroyBuffer(multipoles_);
+    destroyChunkedBuffer(locals_);
+    destroyChunkedBuffer(multipoles_);
     destroyBuffer(tree_);
     destroyBuffer(cellEnd_);
     destroyBuffer(cellStart_);
@@ -306,11 +312,20 @@ void VulkanSimulation::createDevice() {
     preferDeviceLocalHostVisible_ = !hasPortabilitySubset;
     segmentSimulationSubmits_ = hasPortabilitySubset;
 
+    VkPhysicalDeviceFeatures supportedFeatures{};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
+    if (!supportedFeatures.shaderStorageBufferArrayDynamicIndexing) {
+        throw std::runtime_error("Vulkan device does not support shaderStorageBufferArrayDynamicIndexing");
+    }
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &queueInfo;
     info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     info.ppEnabledExtensionNames = extensions.data();
+    info.pEnabledFeatures = &enabledFeatures;
     check(vkCreateDevice(physicalDevice_, &info, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
 }
@@ -391,6 +406,11 @@ void VulkanSimulation::destroyBuffer(Buffer& buffer) {
     buffer = {};
 }
 
+void VulkanSimulation::destroyChunkedBuffer(ChunkedBuffer& buffer) {
+    for (Buffer& chunk : buffer.chunks) destroyBuffer(chunk);
+    buffer = {};
+}
+
 void VulkanSimulation::copyBufferBlocking(const Buffer& src, const Buffer& dst, VkDeviceSize size, const char* what) {
     if (size == 0) return;
     const char* label = what != nullptr ? what : "buffer copy";
@@ -448,6 +468,56 @@ void VulkanSimulation::copyBufferBlocking(const Buffer& src, const Buffer& dst, 
     vkFreeCommandBuffers(device_, commandPool_, 1, &copyCommand);
 }
 
+VulkanSimulation::ChunkedBuffer VulkanSimulation::createChunkedBuffer(VkDeviceSize elementCount,
+                                                                      VkDeviceSize elementSize,
+                                                                      VkBufferUsageFlags usage,
+                                                                      VkMemoryPropertyFlags properties,
+                                                                      const char* name) {
+    if (elementSize == 0) throw std::runtime_error("Cannot create chunked buffer with zero-sized elements");
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(physicalDevice_, &deviceProperties);
+    VkDeviceSize maxRange = deviceProperties.limits.maxStorageBufferRange;
+    if (const char* chunkBytesEnv = std::getenv("SPH_STORAGE_CHUNK_BYTES")) {
+        const uint64_t requestedBytes = std::strtoull(chunkBytesEnv, nullptr, 10);
+        if (requestedBytes > 0) {
+            maxRange = std::min<VkDeviceSize>(maxRange, static_cast<VkDeviceSize>(requestedBytes));
+        }
+    }
+    const VkDeviceSize elementsPerChunk = maxRange / elementSize;
+    if (elementsPerChunk == 0) {
+        throw std::runtime_error(std::string("Storage buffer element for '") + name +
+                                 "' is larger than this device's maxStorageBufferRange");
+    }
+
+    ChunkedBuffer out;
+    out.logicalSize = elementCount * elementSize;
+    out.elementSize = elementSize;
+    out.elementsPerChunk = static_cast<uint32_t>(std::min<VkDeviceSize>(
+        elementsPerChunk, static_cast<VkDeviceSize>(std::numeric_limits<uint32_t>::max())));
+    const VkDeviceSize chunkCount = std::max<VkDeviceSize>(
+        1, (elementCount + out.elementsPerChunk - 1) / out.elementsPerChunk);
+    if (chunkCount > kMaxChunkedStorageBuffers) {
+        throw std::runtime_error(std::string("Storage buffer '") + name + "' needs " +
+                                 std::to_string(static_cast<unsigned long long>(chunkCount)) +
+                                 " chunks, but this build supports " +
+                                 std::to_string(kMaxChunkedStorageBuffers));
+    }
+
+    out.chunks.reserve(static_cast<size_t>(chunkCount));
+    try {
+        VkDeviceSize remaining = elementCount;
+        for (VkDeviceSize chunk = 0; chunk < chunkCount; ++chunk) {
+            const VkDeviceSize chunkElements = std::min<VkDeviceSize>(remaining, out.elementsPerChunk);
+            out.chunks.push_back(createBuffer(chunkElements * elementSize, usage, properties));
+            remaining -= chunkElements;
+        }
+    } catch (...) {
+        destroyChunkedBuffer(out);
+        throw;
+    }
+    return out;
+}
+
 void VulkanSimulation::uploadBuffer(const Buffer& dst, const void* data, VkDeviceSize size, const char* what) {
     if (size == 0) return;
     if (dst.mapped) {
@@ -484,6 +554,20 @@ void VulkanSimulation::downloadBuffer(const Buffer& src, void* data, VkDeviceSiz
         throw;
     }
     destroyBuffer(staging);
+}
+
+void VulkanSimulation::downloadChunkedBuffer(const ChunkedBuffer& src, void* data, VkDeviceSize size, const char* what) {
+    if (size == 0) return;
+    if (size > src.logicalSize) throw std::runtime_error("Chunked buffer download exceeds logical buffer size");
+    auto* bytes = static_cast<std::byte*>(data);
+    VkDeviceSize copied = 0;
+    for (size_t i = 0; i < src.chunks.size() && copied < size; ++i) {
+        const VkDeviceSize copySize = std::min<VkDeviceSize>(src.chunks[i].size, size - copied);
+        const std::string label = std::string(what != nullptr ? what : "download chunked buffer") +
+            " chunk " + std::to_string(i);
+        downloadBuffer(src.chunks[i], bytes + copied, copySize, label.c_str());
+        copied += copySize;
+    }
 }
 
 void VulkanSimulation::createBuffers() {
@@ -663,12 +747,12 @@ void VulkanSimulation::applyOctreeData(const OctreeData& octree) {
         tree_ = createBuffer(treeCapacity_ * sizeof(int32_t), storage, deviceLocal);
     }
     if (static_cast<size_t>(octree.nodeValues) > nodeCapacity_) {
-        destroyBuffer(multipoles_);
-        destroyBuffer(locals_);
+        destroyChunkedBuffer(multipoles_);
+        destroyChunkedBuffer(locals_);
         destroyBuffer(parentIndexes_);
         nodeCapacity_ = static_cast<size_t>(static_cast<double>(octree.nodeValues) * 1.1) + 64;
-        multipoles_ = createBuffer(nodeCapacity_ * sizeof(GpuMultipole), storage, deviceLocal);
-        locals_ = createBuffer(nodeCapacity_ * sizeof(GpuLocal), storage, deviceLocal);
+        multipoles_ = createChunkedBuffer(nodeCapacity_, sizeof(GpuMultipole), storage, deviceLocal, "multipoles");
+        locals_ = createChunkedBuffer(nodeCapacity_, sizeof(GpuLocal), storage, deviceLocal, "locals");
         parentIndexes_ = createBuffer(nodeCapacity_ * sizeof(uint32_t), storage, deviceLocal);
     }
     size_t totalLevelEntries = 0;
@@ -694,11 +778,46 @@ void VulkanSimulation::applyOctreeData(const OctreeData& octree) {
     uploadBuffer(treeLevel_, levelData.data(), levelData.size() * sizeof(int32_t), "upload octree levels");
     const size_t localGravSize = std::max<size_t>(1, maxLevel * MaxUncheckedPointers);
     if (localGravSize > localGravCapacity_) {
-        destroyBuffer(localGravA_);
-        destroyBuffer(localGravB_);
+        destroyChunkedBuffer(localGravA_);
+        destroyChunkedBuffer(localGravB_);
         localGravCapacity_ = static_cast<size_t>(static_cast<double>(localGravSize) * 1.1) + 64;
-        localGravA_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, deviceLocal);
-        localGravB_ = createBuffer(localGravCapacity_ * sizeof(int32_t), storage, deviceLocal);
+        localGravA_ = createChunkedBuffer(localGravCapacity_, sizeof(int32_t), storage, deviceLocal, "localGravA");
+        localGravB_ = createChunkedBuffer(localGravCapacity_, sizeof(int32_t), storage, deviceLocal, "localGravB");
+    }
+    if (std::getenv("SPH_TRACE_OCTREE_LEVELS") != nullptr) {
+        const auto gib = [](size_t bytes) {
+            return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+        };
+        std::cout << "[octree] tree_entries=" << octree.tree.size()
+                  << " node_values=" << octree.nodeValues
+                  << " levels=" << treeLevels_.size()
+                  << " max_level_nodes=" << maxLevel
+                  << " local_grav_capacity=" << localGravCapacity_
+                  << " local_grav_buffer_gib=" << gib(localGravCapacity_ * sizeof(int32_t))
+                  << " multipole_chunks=" << multipoles_.chunks.size()
+                  << " multipole_chunk_elements=" << multipoles_.elementsPerChunk
+                  << " local_chunks=" << locals_.chunks.size()
+                  << " local_chunk_elements=" << locals_.elementsPerChunk
+                  << " local_grav_chunks=" << localGravA_.chunks.size()
+                  << " local_grav_chunk_elements=" << localGravA_.elementsPerChunk
+                  << "\n";
+        size_t parentStride = 0;
+        for (size_t level = 0; level < treeLevels_.size(); ++level) {
+            const size_t nodes = treeLevels_[level].size();
+            const size_t stride = std::max<size_t>(1, localGravCapacity_ / std::max<size_t>(1, nodes));
+            const size_t maxParentStart = level == 0 || treeLevels_[level - 1].empty()
+                ? 0
+                : (treeLevels_[level - 1].size() - 1) * parentStride;
+            std::cout << "[octree] level=" << level
+                      << " nodes=" << nodes
+                      << " stride=" << stride
+                      << " parent_stride=" << parentStride
+                      << " max_parent_start=" << maxParentStart
+                      << " int32_parent_start_overflow="
+                      << (maxParentStart > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ? "yes" : "no")
+                      << "\n";
+            parentStride = stride;
+        }
     }
     uploadBuffer(tree_, octree.tree.data(), octree.tree.size() * sizeof(int32_t), "upload octree");
     if (descriptorSet_ != VK_NULL_HANDLE) updateDescriptorSet();
@@ -792,50 +911,163 @@ VkShaderModule VulkanSimulation::shaderModule(const std::string& path) const {
 
 void VulkanSimulation::updateDescriptorSet() {
     if (descriptorSet_ == VK_NULL_HANDLE) return;
-    std::array<Buffer*, 76> buffers = {&positions_, &velocities_, &densities_, &internalEnergy_, &masses_,
-                                       &smoothingLengths_, &pressures_, &materialIds_, &temperatures_, &alive_,
-                                       &accelerations_, &gravAccelerations_, &dInternalEnergy_, &dhDt_,
-                                       &tree_, &multipoles_, &locals_, &parentIndexes_, &treeLevel_,
-                                       &localGravA_, &localGravB_, &gravAbs_,
-                                       &cellArrayA_, &cellArrayB_, &largeParticleCells_, &bucketHist_,
-                                       &bucketOffset_, &particleOffset_, &cellStart_, &cellEnd_,
-                                       &accelerations1_, &dInternalEnergy1_, &gradientTerms_, &speedOfSound_,
-                                       &balsara_, &alpha_, &daDt_, &alphaLoc_, &pAlphaLoc_, &localMaxH_,
-                                       &nextActiveTime_, &eosTables_, &eosMeta_, &stepTicks_, &active_,
-                                       &gravityStepTicks_, &rhoGrads_,
-                                       &scratchPositions_, &scratchVelocities_, &scratchDensities_, &scratchInternalEnergy_,
-                                       &scratchMasses_, &scratchSmoothingLengths_, &scratchPressures_, &scratchMaterialIds_,
-                                       &scratchTemperatures_, &scratchAlive_, &scratchAccelerations_, &scratchGravAccelerations_,
-                                       &scratchDInternalEnergy_, &scratchDhDt_, &scratchGravAbs_, &scratchAccelerations1_,
-                                       &scratchDInternalEnergy1_, &scratchGradientTerms_, &scratchRhoGrads_, &scratchSpeedOfSound_,
-                                       &scratchBalsara_, &scratchAlpha_, &scratchDaDt_, &scratchAlphaLoc_,
-                                       &scratchPAlphaLoc_, &scratchLocalMaxH_, &scratchNextActiveTime_,
-                                       &particleIds_, &scratchParticleIds_};
-    std::array<VkDescriptorBufferInfo, 76> infos{};
-    std::array<VkWriteDescriptorSet, 76> writes{};
-    for (uint32_t i = 0; i < buffers.size(); ++i) {
-        infos[i].buffer = buffers[i]->buffer;
-        infos[i].offset = 0;
-        infos[i].range = buffers[i]->size;
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = descriptorSet_;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &infos[i];
-    }
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physicalDevice_, &properties);
+    const VkDeviceSize maxStorageBufferRange = properties.limits.maxStorageBufferRange;
+
+    struct SingleBinding {
+        uint32_t binding = 0;
+        Buffer* buffer = nullptr;
+        const char* name = nullptr;
+    };
+    const std::array<SingleBinding, kSimulationBindingCount - kChunkedStorageBindingCount> singleBindings = {{
+        {0, &positions_, "positions"},
+        {1, &velocities_, "velocities"},
+        {2, &densities_, "densities"},
+        {3, &internalEnergy_, "internalEnergy"},
+        {4, &masses_, "masses"},
+        {5, &smoothingLengths_, "smoothingLengths"},
+        {6, &pressures_, "pressures"},
+        {7, &materialIds_, "materialIds"},
+        {8, &temperatures_, "temperatures"},
+        {9, &alive_, "alive"},
+        {10, &accelerations_, "accelerations"},
+        {11, &gravAccelerations_, "gravAccelerations"},
+        {12, &dInternalEnergy_, "dInternalEnergy"},
+        {13, &dhDt_, "dhDt"},
+        {14, &tree_, "tree"},
+        {17, &parentIndexes_, "parentIndexes"},
+        {18, &treeLevel_, "treeLevel"},
+        {21, &gravAbs_, "gravAbs"},
+        {22, &cellArrayA_, "cellArrayA"},
+        {23, &cellArrayB_, "cellArrayB"},
+        {24, &largeParticleCells_, "largeParticleCells"},
+        {25, &bucketHist_, "bucketHist"},
+        {26, &bucketOffset_, "bucketOffset"},
+        {27, &particleOffset_, "particleOffset"},
+        {28, &cellStart_, "cellStart"},
+        {29, &cellEnd_, "cellEnd"},
+        {30, &accelerations1_, "accelerations1"},
+        {31, &dInternalEnergy1_, "dInternalEnergy1"},
+        {32, &gradientTerms_, "gradientTerms"},
+        {33, &speedOfSound_, "speedOfSound"},
+        {34, &balsara_, "balsara"},
+        {35, &alpha_, "alpha"},
+        {36, &daDt_, "daDt"},
+        {37, &alphaLoc_, "alphaLoc"},
+        {38, &pAlphaLoc_, "pAlphaLoc"},
+        {39, &localMaxH_, "localMaxH"},
+        {40, &nextActiveTime_, "nextActiveTime"},
+        {41, &eosTables_, "eosTables"},
+        {42, &eosMeta_, "eosMeta"},
+        {43, &stepTicks_, "stepTicks"},
+        {44, &active_, "active"},
+        {45, &gravityStepTicks_, "gravityStepTicks"},
+        {46, &rhoGrads_, "rhoGrads"},
+        {47, &scratchPositions_, "scratchPositions"},
+        {48, &scratchVelocities_, "scratchVelocities"},
+        {49, &scratchDensities_, "scratchDensities"},
+        {50, &scratchInternalEnergy_, "scratchInternalEnergy"},
+        {51, &scratchMasses_, "scratchMasses"},
+        {52, &scratchSmoothingLengths_, "scratchSmoothingLengths"},
+        {53, &scratchPressures_, "scratchPressures"},
+        {54, &scratchMaterialIds_, "scratchMaterialIds"},
+        {55, &scratchTemperatures_, "scratchTemperatures"},
+        {56, &scratchAlive_, "scratchAlive"},
+        {57, &scratchAccelerations_, "scratchAccelerations"},
+        {58, &scratchGravAccelerations_, "scratchGravAccelerations"},
+        {59, &scratchDInternalEnergy_, "scratchDInternalEnergy"},
+        {60, &scratchDhDt_, "scratchDhDt"},
+        {61, &scratchGravAbs_, "scratchGravAbs"},
+        {62, &scratchAccelerations1_, "scratchAccelerations1"},
+        {63, &scratchDInternalEnergy1_, "scratchDInternalEnergy1"},
+        {64, &scratchGradientTerms_, "scratchGradientTerms"},
+        {65, &scratchRhoGrads_, "scratchRhoGrads"},
+        {66, &scratchSpeedOfSound_, "scratchSpeedOfSound"},
+        {67, &scratchBalsara_, "scratchBalsara"},
+        {68, &scratchAlpha_, "scratchAlpha"},
+        {69, &scratchDaDt_, "scratchDaDt"},
+        {70, &scratchAlphaLoc_, "scratchAlphaLoc"},
+        {71, &scratchPAlphaLoc_, "scratchPAlphaLoc"},
+        {72, &scratchLocalMaxH_, "scratchLocalMaxH"},
+        {73, &scratchNextActiveTime_, "scratchNextActiveTime"},
+        {74, &particleIds_, "particleIds"},
+        {75, &scratchParticleIds_, "scratchParticleIds"},
+    }};
+
+    std::vector<VkDescriptorBufferInfo> infos;
+    infos.reserve(kSimulationDescriptorCount);
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(kSimulationBindingCount);
+
+    auto addWrite = [&](uint32_t binding, uint32_t descriptorCount, const VkDescriptorBufferInfo* bufferInfo) {
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = descriptorSet_;
+        write.dstBinding = binding;
+        write.descriptorCount = descriptorCount;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = bufferInfo;
+        writes.push_back(write);
+    };
+
+    auto addSingle = [&](uint32_t binding, const Buffer& buffer, const char* name) {
+        if (buffer.buffer == VK_NULL_HANDLE) {
+            throw std::runtime_error(std::string("Storage buffer '") + name + "' was not created");
+        }
+        if (buffer.size > maxStorageBufferRange) {
+            throw std::runtime_error(
+                std::string("Storage buffer '") + name + "' is " +
+                std::to_string(static_cast<unsigned long long>(buffer.size)) +
+                " bytes, exceeding this device's maxStorageBufferRange of " +
+                std::to_string(static_cast<unsigned long long>(maxStorageBufferRange)) +
+                " bytes. Split this buffer before running this particle count.");
+        }
+        const size_t infoOffset = infos.size();
+        infos.push_back({buffer.buffer, 0, buffer.size});
+        addWrite(binding, 1, &infos[infoOffset]);
+    };
+
+    auto addChunked = [&](uint32_t binding, const ChunkedBuffer& buffer, const char* name) {
+        if (buffer.chunks.empty()) {
+            throw std::runtime_error(std::string("Chunked storage buffer '") + name + "' was not created");
+        }
+        const size_t infoOffset = infos.size();
+        for (uint32_t i = 0; i < kMaxChunkedStorageBuffers; ++i) {
+            const Buffer& chunk = i < buffer.chunks.size() ? buffer.chunks[i] : buffer.chunks.front();
+            if (chunk.size > maxStorageBufferRange) {
+                throw std::runtime_error(
+                    std::string("Storage buffer chunk '") + name + "[" + std::to_string(i) + "]' is " +
+                    std::to_string(static_cast<unsigned long long>(chunk.size)) +
+                    " bytes, exceeding this device's maxStorageBufferRange of " +
+                    std::to_string(static_cast<unsigned long long>(maxStorageBufferRange)) + " bytes.");
+            }
+            infos.push_back({chunk.buffer, 0, chunk.size});
+        }
+        addWrite(binding, kMaxChunkedStorageBuffers, &infos[infoOffset]);
+    };
+
+    for (const SingleBinding& binding : singleBindings) addSingle(binding.binding, *binding.buffer, binding.name);
+    addChunked(15, multipoles_, "multipoles");
+    addChunked(16, locals_, "locals");
+    addChunked(19, localGravA_, "localGravA");
+    addChunked(20, localGravB_, "localGravB");
+
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void VulkanSimulation::createPipeline() {
     std::cout << "Creating simulation descriptor layout..." << std::endl;
-    std::array<VkDescriptorSetLayoutBinding, 76> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, kSimulationBindingCount> bindings{};
     for (uint32_t i = 0; i < bindings.size(); ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
+    bindings[15].descriptorCount = kMaxChunkedStorageBuffers;
+    bindings[16].descriptorCount = kMaxChunkedStorageBuffers;
+    bindings[19].descriptorCount = kMaxChunkedStorageBuffers;
+    bindings[20].descriptorCount = kMaxChunkedStorageBuffers;
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
@@ -889,7 +1121,7 @@ void VulkanSimulation::createPipeline() {
     std::cout << "Creating simulation descriptor set..." << std::endl;
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = static_cast<uint32_t>(bindings.size());
+    poolSize.descriptorCount = kSimulationDescriptorCount;
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = 1;
@@ -957,6 +1189,9 @@ void VulkanSimulation::step(int maxTicks) {
     pc.boxSize = static_cast<float>(params::boxSize);
     pc.gravitySoftening = params::gravitySmoothingLength;
     pc.cellTableSize = static_cast<int32_t>(cellTableSize_);
+    pc.multipoleChunkElements = static_cast<int32_t>(multipoles_.elementsPerChunk);
+    pc.localChunkElements = static_cast<int32_t>(locals_.elementsPerChunk);
+    pc.localGravChunkElements = static_cast<int32_t>(localGravA_.elementsPerChunk);
     auto barrier = [&] {
         VkMemoryBarrier memoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1123,7 +1358,7 @@ void VulkanSimulation::step(int maxTicks) {
             std::vector<GpuMultipole> multipolesHost(nodeCapacity_);
             std::vector<int32_t> treeHost(treeCapacity_);
             std::vector<float> gravAbsHost(particleCount_);
-            downloadBuffer(multipoles_, multipolesHost.data(), multipolesHost.size() * sizeof(GpuMultipole), "download gravity stats multipoles");
+            downloadChunkedBuffer(multipoles_, multipolesHost.data(), multipolesHost.size() * sizeof(GpuMultipole), "download gravity stats multipoles");
             downloadBuffer(tree_, treeHost.data(), treeHost.size() * sizeof(int32_t), "download gravity stats tree");
             downloadBuffer(gravAbs_, gravAbsHost.data(), gravAbsHost.size() * sizeof(float), "download gravity stats magnitudes");
             const auto* multipoles = multipolesHost.data();
@@ -1258,11 +1493,11 @@ void VulkanSimulation::step(int maxTicks) {
                 submitProfileSegment(label.c_str());
             }
             if (traceGravityBuffers) {
-                const Buffer& outBuffer = (level & 1u) == 0u ? localGravB_ : localGravA_;
+                const ChunkedBuffer& outBuffer = (level & 1u) == 0u ? localGravB_ : localGravA_;
                 std::vector<int32_t> outHost(localGravCapacity_);
                 std::vector<int32_t> treeHost(treeCapacity_);
                 std::vector<uint32_t> parentIndexesHost(nodeCapacity_);
-                downloadBuffer(outBuffer, outHost.data(), outHost.size() * sizeof(int32_t), "download gravity trace output");
+                downloadChunkedBuffer(outBuffer, outHost.data(), outHost.size() * sizeof(int32_t), "download gravity trace output");
                 downloadBuffer(tree_, treeHost.data(), treeHost.size() * sizeof(int32_t), "download gravity trace tree");
                 downloadBuffer(parentIndexes_, parentIndexesHost.data(), parentIndexesHost.size() * sizeof(uint32_t), "download gravity trace parents");
                 const auto* out = outHost.data();

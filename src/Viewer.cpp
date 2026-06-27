@@ -378,11 +378,19 @@ void VulkanViewer::createDevice() {
         queues.push_back(queue);
     }
     std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_portability_subset"};
+    VkPhysicalDeviceFeatures supportedFeatures{};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
+    if (!supportedFeatures.shaderStorageBufferArrayDynamicIndexing) {
+        throw std::runtime_error("Vulkan device does not support shaderStorageBufferArrayDynamicIndexing");
+    }
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.queueCreateInfoCount = static_cast<uint32_t>(queues.size());
     info.pQueueCreateInfos = queues.data();
     info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     info.ppEnabledExtensionNames = extensions.data();
+    info.pEnabledFeatures = &enabledFeatures;
     vkCheck(vkCreateDevice(physicalDevice_, &info, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, *queueFamilies_.graphics, 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, *queueFamilies_.present, 0, &presentQueue_);

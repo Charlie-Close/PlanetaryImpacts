@@ -40,6 +40,12 @@ public:
         VkDeviceSize size = 0;
         void* mapped = nullptr;
     };
+    struct ChunkedBuffer {
+        std::vector<Buffer> chunks;
+        VkDeviceSize logicalSize = 0;
+        VkDeviceSize elementSize = 0;
+        uint32_t elementsPerChunk = 0;
+    };
     const Buffer& positionsBuffer() const { return positions_; }
     const Buffer& densitiesBuffer() const { return densities_; }
     const Buffer& smoothingLengthsBuffer() const { return smoothingLengths_; }
@@ -94,6 +100,9 @@ private:
         int32_t uncheckedParentStride = 0;
         int32_t gravityLevelParity = 0;
         int32_t dispatchOffset = 0;
+        int32_t multipoleChunkElements = 1;
+        int32_t localChunkElements = 1;
+        int32_t localGravChunkElements = 1;
     };
 
     enum PipelineIndex : size_t {
@@ -129,10 +138,17 @@ private:
     void applyPendingOctreeBuild(bool profileStep);
     void startAsyncOctreeBuild();
     void destroyBuffer(Buffer& buffer);
+    void destroyChunkedBuffer(ChunkedBuffer& buffer);
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+    ChunkedBuffer createChunkedBuffer(VkDeviceSize elementCount,
+                                      VkDeviceSize elementSize,
+                                      VkBufferUsageFlags usage,
+                                      VkMemoryPropertyFlags properties,
+                                      const char* name);
     void copyBufferBlocking(const Buffer& src, const Buffer& dst, VkDeviceSize size, const char* what);
     void uploadBuffer(const Buffer& dst, const void* data, VkDeviceSize size, const char* what);
     void downloadBuffer(const Buffer& src, void* data, VkDeviceSize size, const char* what);
+    void downloadChunkedBuffer(const ChunkedBuffer& src, void* data, VkDeviceSize size, const char* what);
     uint32_t findMemory(uint32_t typeBits,
                         VkMemoryPropertyFlags flags,
                         VkMemoryPropertyFlags preferredFlags = 0,
@@ -184,12 +200,12 @@ private:
     Buffer dInternalEnergy_;
     Buffer dhDt_;
     Buffer tree_;
-    Buffer multipoles_;
-    Buffer locals_;
+    ChunkedBuffer multipoles_;
+    ChunkedBuffer locals_;
     Buffer parentIndexes_;
     Buffer treeLevel_;
-    Buffer localGravA_;
-    Buffer localGravB_;
+    ChunkedBuffer localGravA_;
+    ChunkedBuffer localGravB_;
     Buffer gravAbs_;
     Buffer cellArrayA_;
     Buffer cellArrayB_;
